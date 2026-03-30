@@ -28,7 +28,7 @@ import { css } from "@/styled-system/css";
 import { ADDRESS_ZERO, InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
-import { decodeEventLog, encodeEventTopics, erc20Abi, maxUint256, parseEventLogs } from "viem";
+import { erc20Abi, Hex, Log, maxUint256, parseEventLogs } from "viem";
 import {
   getBalance,
   getCapabilities,
@@ -481,20 +481,13 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
         // extract trove ID from logs
         const branch = getBranch(ctx.request.branchId);
 
-        const troveOperationLog = receipts.map((r) => r.logs).flat().find((log) =>
-          log.topics[0]
-            === encodeEventTopics({ abi: branch.contracts.TroveManager.abi, eventName: "TroveOperation" })[0]
-        );
-
-        if (!troveOperationLog) {
-          throw new Error("TroveOperation event not found in transaction logs");
-        }
-
-        const troveOperation = decodeEventLog({
+        const [troveOperation] = parseEventLogs({
           abi: branch.contracts.TroveManager.abi,
-          topics: troveOperationLog.topics as [signature: `0x${string}`, ...args: `0x${string}`[]],
-          data: troveOperationLog.data,
-        }) satisfies { eventName: "TroveOperation"; args: { _troveId: bigint } };
+          // parseEventLogs only actually needs topics and data, so we can lie at the type level and use it
+          logs: receipts.map((r) => r.logs satisfies (Pick<Log, "address" | "data"> & { topics: Hex[] })[])
+            .flat() as unknown as Log[],
+          eventName: "TroveOperation",
+        });
 
         if (!troveOperation?.args?._troveId) {
           throw new Error("Failed to extract trove ID from transaction");
@@ -583,20 +576,13 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
         // extract trove ID from logs
         const branch = getBranch(ctx.request.branchId);
 
-        const troveOperationLog = receipts.map((r) => r.logs).flat().find((log) =>
-          log.topics[0]
-            === encodeEventTopics({ abi: branch.contracts.TroveManager.abi, eventName: "TroveOperation" })[0]
-        );
-
-        if (!troveOperationLog) {
-          throw new Error("TroveOperation event not found in transaction logs");
-        }
-
-        const troveOperation = decodeEventLog({
+        const [troveOperation] = parseEventLogs({
           abi: branch.contracts.TroveManager.abi,
-          topics: troveOperationLog.topics as [signature: `0x${string}`, ...args: `0x${string}`[]],
-          data: troveOperationLog.data,
-        }) satisfies { eventName: "TroveOperation"; args: { _troveId: bigint } };
+          // parseEventLogs only actually needs topics and data, so we can lie at the type level and use it
+          logs: receipts.map((r) => r.logs satisfies (Pick<Log, "address" | "data"> & { topics: Hex[] })[])
+            .flat() as unknown as Log[],
+          eventName: "TroveOperation",
+        });
 
         if (!troveOperation?.args?._troveId) {
           throw new Error("Failed to extract trove ID from transaction");
