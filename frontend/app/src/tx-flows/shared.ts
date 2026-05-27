@@ -5,7 +5,8 @@ import { waitForSafeTransaction } from "@/src/safe-utils";
 import { getIndexedBlockNumber } from "@/src/subgraph";
 import { sleep } from "@/src/utils";
 import * as v from "valibot";
-import { waitForTransactionReceipt } from "wagmi/actions";
+import { waitForCallsStatus, waitForTransactionReceipt } from "wagmi/actions";
+import type { Hex, Log } from "viem";
 
 export function createRequestSchema<
   Id extends string,
@@ -65,6 +66,37 @@ export async function verifyBlockNumberIndexation(blockNumber: bigint) {
     console.log(`Waiting for subgraph to catch up... (${blockNumber - indexedBlockNumber} blocks behind)`);
     await sleep((2 ** Math.min(i, 4)) * 1000);
   }
+}
+
+export async function verifyCallsBatch(
+  wagmiConfig: WagmiConfig,
+  callsId: string,
+  waitForSubgraphIndexation: boolean = true,
+) {
+  const { status, receipts } = await waitForCallsStatus(wagmiConfig, { id: callsId });
+  if (status !== "success" || !receipts) {
+    throw new Error("Transaction failed");
+  }
+  const subgraphIsDown = subgraphIndicator.hasError();
+  if (waitForSubgraphIndexation && !subgraphIsDown) {
+    const blockNumbers = receipts
+      .map((r) => r.blockNumber)
+      .filter((n): n is bigint => typeof n === "bigint");
+    if (blockNumbers.length > 0) {
+      await verifyBlockNumberIndexation(
+        blockNumbers.reduce((a, b) => (a > b ? a : b)),
+      );
+    }
+  }
+  return receipts;
+}
+
+export function getCallBatchLogs(
+  receipts: Array<{ logs: Array<Pick<Log, "address" | "data"> & { topics: Hex[] }> }>,
+): Log[] {
+  return receipts
+    .map((r) => r.logs)
+    .flat() as unknown as Log[];
 }
 
 export function isTroveExistsError(error: unknown): boolean {
