@@ -23,22 +23,20 @@ import { addPrefixedTroveIdsToStoredState } from "@/src/services/StoredState";
 import { getIndexedTroveById } from "@/src/subgraph";
 import { TroveId } from "@/src/types";
 import { sleep } from "@/src/utils";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { vAddress, vBranchId, vDnum } from "@/src/valibot-utils";
 import { css } from "@/styled-system/css";
 import { ADDRESS_ZERO, InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
-import { erc20Abi, Hex, Log, maxUint256, parseEventLogs } from "viem";
+import { erc20Abi, maxUint256, parseEventLogs } from "viem";
 import {
   getBalance,
-  getCapabilities,
-  GetCapabilitiesErrorType,
   readContract,
   sendCalls,
-  waitForCallsStatus,
 } from "wagmi/actions";
 import { CONTRACT_WETH } from "../env";
-import { createRequestSchema, verifyTransaction, withOwnerIndexRetry } from "./shared";
+import { createRequestSchema, getCallBatchLogs, verifyCallsBatch, verifyTransaction, withOwnerIndexRetry } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "openBorrowPosition",
@@ -472,20 +470,14 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
       },
 
       async verify(ctx, hash) {
-        const { status, receipts } = await waitForCallsStatus(ctx.wagmiConfig, { id: hash });
-
-        if (status !== "success" || !receipts) {
-          throw new Error("Transaction failed");
-        }
+        const receipts = await verifyCallsBatch(ctx.wagmiConfig, hash);
 
         // extract trove ID from logs
         const branch = getBranch(ctx.request.branchId);
 
         const [troveOperation] = parseEventLogs({
           abi: branch.contracts.TroveManager.abi,
-          // parseEventLogs only actually needs topics and data, so we can lie at the type level and use it
-          logs: receipts.map((r) => r.logs satisfies (Pick<Log, "address" | "data"> & { topics: Hex[] })[])
-            .flat() as unknown as Log[],
+          logs: getCallBatchLogs(receipts),
           eventName: "TroveOperation",
         });
 
@@ -561,26 +553,23 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
             }
           }
 
-          // User has enough ETH, just open the trove directly
-          return ctx.writeContract(openTroveCall);
+          // User has enough ETH, but still submit via sendCalls so verify always gets a calls ID
+          return (await sendCalls(ctx.wagmiConfig, {
+            account: ctx.account,
+            calls: [{ ...openTroveCall, to: openTroveCall.address, value: openTroveCall.value }],
+          })).id;
         });
       },
 
       async verify(ctx, hash) {
-        const { status, receipts } = await waitForCallsStatus(ctx.wagmiConfig, { id: hash });
-
-        if (status !== "success" || !receipts) {
-          throw new Error("Transaction failed");
-        }
+        const receipts = await verifyCallsBatch(ctx.wagmiConfig, hash);
 
         // extract trove ID from logs
         const branch = getBranch(ctx.request.branchId);
 
         const [troveOperation] = parseEventLogs({
           abi: branch.contracts.TroveManager.abi,
-          // parseEventLogs only actually needs topics and data, so we can lie at the type level and use it
-          logs: receipts.map((r) => r.logs satisfies (Pick<Log, "address" | "data"> & { topics: Hex[] })[])
-            .flat() as unknown as Log[],
+          logs: getCallBatchLogs(receipts),
           eventName: "TroveOperation",
         });
 
@@ -594,7 +583,6 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
 
         const subgraphIsDown = subgraphIndicator.hasError();
         if (!subgraphIsDown) {
-          // wait for the trove to appear in the subgraph
           while (true) {
             const trove = await getIndexedTroveById(branch.branchId, troveId);
             if (trove !== null) break;
@@ -607,32 +595,21 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
 
   async getSteps(ctx) {
     const branch = getBranch(ctx.request.branchId);
-
-    const capabilitiesPromise = getCapabilities(ctx.wagmiConfig)
-      .then((capabilities) => ({
-        success: true,
-        capabilities,
-        error: null,
-      } as const))
-      .catch((error: GetCapabilitiesErrorType) => ({ success: false, capabilities: null, error } as const));
+    const capsPromise = getWalletBatchCapabilities(ctx.wagmiConfig);
 
     // ETH doesn't need approval
     if (branch.symbol === "ETH") {
       const totalEthNeeded = ctx.request.collAmount[0] + ETH_GAS_COMPENSATION[0];
-      const cap = await capabilitiesPromise;
-      if (cap.success) {
-        const atomicStatus = (ctx.wagmiConfig.state.chainId in cap.capabilities)
-          ? cap.capabilities[ctx.wagmiConfig.state.chainId]?.atomic?.status
-          : undefined;
-        const canBatch = atomicStatus === "supported" || atomicStatus === "ready";
-        // Check if we need to batch a WETH->ETH conversion before opening trove
-        // Note: In the future, we should also check for auxiliaryFunds capability to allow
-        // users to JIT add ETH inside their wallet when needed
-        if (canBatch) {
-          const ethBalance = await getBalance(ctx.wagmiConfig, { address: ctx.account });
-          if (ethBalance.value < totalEthNeeded) {
-            return ["batchOpenTroveEth"];
-          }
+      const caps = await capsPromise;
+      // Check if we need to batch a WETH->ETH conversion before opening trove.
+      // Non-atomic batching is safe here because WETH->ETH is just converting
+      // the user's own collateral; there is no front-run risk.
+      // Note: In the future, we should also check for auxiliaryFunds capability to allow
+      // users to JIT add ETH inside their wallet when needed
+      if (caps.supportsBatch) {
+        const ethBalance = await getBalance(ctx.wagmiConfig, { address: ctx.account });
+        if (ethBalance.value < totalEthNeeded) {
+          return ["batchOpenTroveEth"];
         }
       }
       return ["openTroveEth"];
@@ -647,18 +624,12 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
 
     const steps: string[] = [];
 
-    const cap = await capabilitiesPromise;
-    if (cap.success) {
-      const atomicStatus = (ctx.wagmiConfig.state.chainId in cap.capabilities)
-        ? cap.capabilities[ctx.wagmiConfig.state.chainId]?.atomic?.status
-        : undefined;
-      const canBatch = atomicStatus === "supported" || atomicStatus === "ready";
-      if (canBatch) {
-        ctx.preferredApproveMethod = "approve-amount";
-        // early return steps with atomic approval and trove opening
-        steps.push("batchApproveAndOpenTroveLst");
-        return steps;
-      }
+    const caps = await capsPromise;
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      // early return steps with batched approval and trove opening
+      steps.push("batchApproveAndOpenTroveLst");
+      return steps;
     }
 
     if (allowance < ctx.request.collAmount[0]) {
