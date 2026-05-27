@@ -16,9 +16,10 @@ import { InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
-import { readContract, readContracts } from "wagmi/actions";
+import { readContract, readContracts, sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { useSlippageRefund } from "../liquity-leverage";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "closeLoanPosition",
@@ -234,10 +235,69 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
         }
       },
     },
+
+    batchApproveAndClose: {
+      name: () => "Close loan",
+      Status: TransactionStatus,
+
+      async commit(ctx) {
+        const { loan } = ctx.request;
+        const branch = getBranch(loan.branchId);
+
+        const Zapper = branch.symbol === "ETH"
+          ? branch.contracts.LeverageWETHZapper
+          : branch.contracts.LeverageLSTZapper;
+
+        const { entireDebt } = await readContract(ctx.wagmiConfig, {
+          ...branch.contracts.TroveManager,
+          functionName: "getLatestTroveData",
+          args: [BigInt(loan.troveId)],
+        });
+
+        return (await sendCalls(ctx.wagmiConfig, {
+          account: ctx.account,
+          calls: [
+            {
+              to: ctx.contracts.BoldToken.address,
+              abi: ctx.contracts.BoldToken.abi,
+              functionName: "approve",
+              args: [
+                Zapper.address,
+                ctx.preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : dn.mul([entireDebt, 18], 1.1)[0],
+              ],
+            },
+            {
+              to: Zapper.address,
+              abi: Zapper.abi,
+              functionName: "closeTroveToRawETH",
+              args: [BigInt(loan.troveId)],
+            },
+          ],
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+
+        const subgraphIsDown = subgraphIndicator.hasError();
+        if (!subgraphIsDown) {
+          while (true) {
+            const trove = await getIndexedTroveById(
+              ctx.request.loan.branchId,
+              ctx.request.loan.troveId,
+            );
+            if (trove?.status === "closed") break;
+            await sleep(1000);
+          }
+        }
+      },
+    },
   },
 
   async getSteps(ctx) {
-    const { loan } = ctx.request;
+    const { loan, repayWithCollateral } = ctx.request;
     const branch = getBranch(loan.branchId);
 
     const Zapper = branch.symbol === "ETH"
@@ -257,11 +317,15 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
       allowFailure: false,
     });
 
-    const isBoldApproved = ctx.request.repayWithCollateral || (
-      entireDebt <= boldAllowance
-    );
+    const isBoldApproved = repayWithCollateral || (entireDebt <= boldAllowance);
 
     const steps: string[] = [];
+
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch && !repayWithCollateral) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndClose"];
+    }
 
     if (!isBoldApproved) {
       steps.push("approveBold");

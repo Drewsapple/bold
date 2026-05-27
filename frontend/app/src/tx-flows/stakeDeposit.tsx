@@ -7,13 +7,14 @@ import { signPermit } from "@/src/permit";
 import { TransactionDetailsRow } from "@/src/screens/TransactionsScreen/TransactionsScreen";
 import { TransactionStatus } from "@/src/screens/TransactionsScreen/TransactionStatus";
 import { usePrice } from "@/src/services/Prices";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { vDnum, vPositionStake } from "@/src/valibot-utils";
 import { useAccount } from "@/src/wagmi-utils";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { encodeFunctionData, maxUint256 } from "viem";
-import { getBytecode } from "wagmi/actions";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { getBytecode, sendCalls } from "wagmi/actions";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "stakeDeposit",
@@ -194,9 +195,91 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    // Wallet-level batch via EIP-5792 sendCalls
+    batchDeposit: {
+      name: () => "Stake",
+      Status: TransactionStatus,
+      async commit(ctx) {
+        const { Governance, LqtyToken } = ctx.contracts;
+        const calls: Array<{
+          to: typeof Governance.address;
+          abi: typeof Governance.abi;
+          functionName: string;
+          args?: unknown[];
+        } | {
+          to: typeof LqtyToken.address;
+          abi: typeof LqtyToken.abi;
+          functionName: string;
+          args: unknown[];
+        }> = [];
+
+        const userProxyAddress = await ctx.readContract({
+          ...Governance,
+          functionName: "deriveUserProxyAddress",
+          args: [ctx.account],
+        });
+
+        const userProxyBytecode = await getBytecode(ctx.wagmiConfig, {
+          address: userProxyAddress,
+        });
+
+        // deploy proxy if needed
+        if (!userProxyBytecode) {
+          calls.push({
+            to: Governance.address,
+            abi: Governance.abi,
+            functionName: "deployUserProxy",
+          });
+        }
+
+        // check allowance
+        const lqtyAllowance = await ctx.readContract({
+          ...LqtyToken,
+          functionName: "allowance",
+          args: [ctx.account, userProxyAddress],
+        });
+
+        // approve if needed
+        if (dn.gt(ctx.request.lqtyAmount, dnum18(lqtyAllowance))) {
+          calls.push({
+            to: LqtyToken.address,
+            abi: LqtyToken.abi,
+            functionName: "approve",
+            args: [userProxyAddress, ctx.request.lqtyAmount[0]],
+          });
+        }
+
+        // deposit LQTY
+        calls.push({
+          to: Governance.address,
+          abi: Governance.abi,
+          functionName: "depositLQTY",
+          args: [ctx.request.lqtyAmount[0]],
+        });
+
+        return (await sendCalls(ctx.wagmiConfig, {
+          account: ctx.account,
+          calls,
+        })).id;
+      },
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+
+    // If the wallet supports batching, use a single batched step.
+    // This combines deployUserProxy (if needed), approve (if needed),
+    // and deposit into one wallet-level batch.
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchDeposit"];
+    }
+
     const steps: string[] = [];
 
     // get the user proxy address

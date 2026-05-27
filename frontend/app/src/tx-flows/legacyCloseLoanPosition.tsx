@@ -13,7 +13,9 @@ import { vBranchId, vDnum, vTroveId } from "@/src/valibot-utils";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { erc20Abi, maxUint256 } from "viem";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "legacyCloseLoanPosition",
@@ -154,6 +156,48 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchApproveAndClose: {
+      name: () => "Close loan",
+      Status: TransactionStatus,
+
+      async commit(ctx) {
+        const { trove } = ctx.request;
+        const branch = getLegacyBranch(trove.branchId);
+        const { LEVERAGE_ZAPPER } = branch;
+
+        if (!LEGACY_CHECK?.BOLD_TOKEN) {
+          throw new Error("BOLD token address not available");
+        }
+
+        return (await sendCalls(ctx.wagmiConfig, {
+          account: ctx.account,
+          calls: [
+            {
+              to: LEGACY_CHECK.BOLD_TOKEN,
+              abi: erc20Abi,
+              functionName: "approve",
+              args: [
+                LEVERAGE_ZAPPER,
+                ctx.preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : dn.mul(trove.borrowed, 1.1)[0],
+              ],
+            },
+            {
+              to: LEVERAGE_ZAPPER,
+              abi: branch.symbol === "ETH" ? LeverageWETHZapper : LeverageLSTZapper,
+              functionName: "closeTroveToRawETH",
+              args: [BigInt(trove.troveId)],
+            },
+          ],
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
@@ -163,6 +207,13 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
     if (!LEGACY_CHECK?.BOLD_TOKEN) {
       throw new Error("BOLD token address not available");
     }
+
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndClose"];
+    }
+
     const isBoldApproved = !dn.gt(trove.borrowed, [
       (await ctx.readContract({
         abi: erc20Abi,

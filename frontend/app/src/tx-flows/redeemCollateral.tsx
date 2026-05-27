@@ -12,8 +12,10 @@ import { HFlex, InfoTooltip, TokenIcon, VFlex } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { REDEMPTION_SLIPPAGE_TOLERANCE } from "../constants";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "redeemCollateral",
@@ -148,9 +150,57 @@ export const redeemCollateral: FlowDeclaration<RedeemCollateralRequest> = {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchApproveAndRedeem: {
+      name: () => "Redeem BOLD",
+      Status: TransactionStatus,
+
+      async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
+        const bold = dn.from(request.amount, 18)[0];
+        const maxIterationsPerCollateral = BigInt(request.maxIterationsPerCollateral);
+        const maxFeePct = dn.add(request.feePct, request.slippageTolerance, 18)[0];
+        const slippageFactor = dn.sub(DNUM_1, request.slippageTolerance);
+        const minCollRedeemed = request.collRedeemed.map((collRedeemed) => dn.mul(collRedeemed, slippageFactor, 18)[0]);
+        const RedemptionHelper = getProtocolContract("RedemptionHelper");
+        const BoldToken = getProtocolContract("BoldToken");
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls: [
+            {
+              to: BoldToken.address,
+              abi: BoldToken.abi,
+              functionName: "approve",
+              args: [
+                RedemptionHelper.address,
+                preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : bold,
+              ],
+            },
+            {
+              to: RedemptionHelper.address,
+              abi: RedemptionHelper.abi,
+              functionName: "redeemCollateral",
+              args: [bold, maxIterationsPerCollateral, maxFeePct, minCollRedeemed],
+            },
+          ],
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndRedeem"];
+    }
+
     const steps = [];
 
     // check for allowance

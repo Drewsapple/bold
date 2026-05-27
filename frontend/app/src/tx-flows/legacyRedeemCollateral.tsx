@@ -12,9 +12,11 @@ import { useQuery } from "@tanstack/react-query";
 import * as dn from "dnum";
 import { Fragment } from "react";
 import * as v from "valibot";
-import { createPublicClient, erc20Abi } from "viem";
+import { createPublicClient, erc20Abi, maxUint256 } from "viem";
 import { http, useConfig as useWagmiConfig } from "wagmi";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "legacyRedeemCollateral",
@@ -125,11 +127,57 @@ export const legacyRedeemCollateral: FlowDeclaration<LegacyRedeemCollateralReque
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchApproveAndRedeem: {
+      name: () => "Redeem BOLD",
+      Status: TransactionStatus,
+      async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
+        if (!LEGACY_CHECK) {
+          throw new Error("LEGACY_CHECK is not defined");
+        }
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls: [
+            {
+              to: LEGACY_CHECK.BOLD_TOKEN,
+              abi: erc20Abi,
+              functionName: "approve",
+              args: [
+                LEGACY_CHECK.COLLATERAL_REGISTRY,
+                preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : request.amount[0],
+              ],
+            },
+            {
+              to: LEGACY_CHECK.COLLATERAL_REGISTRY,
+              abi: CollateralRegistry,
+              functionName: "redeemCollateral",
+              args: [
+                request.amount[0],
+                0n,
+                request.maxFee[0],
+              ],
+            },
+          ],
+        })).id;
+      },
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
     if (!LEGACY_CHECK) {
       throw new Error("LEGACY_CHECK is not defined");
+    }
+
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndRedeem"];
     }
 
     const steps = [];
