@@ -28,9 +28,10 @@ import { ADDRESS_ZERO, InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { maxUint256, parseEventLogs } from "viem";
-import { readContract } from "wagmi/actions";
+import { readContract, sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { useSlippageRefund } from "../liquity-leverage";
-import { createRequestSchema, verifyTransaction, withOwnerIndexRetry } from "./shared";
+import { createRequestSchema, getCallBatchLogs, verifyCallsBatch, verifyTransaction, withOwnerIndexRetry } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "openLeveragePosition",
@@ -326,6 +327,108 @@ export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> 
         }
       },
     },
+
+    batchApproveAndOpen: {
+      name: () => "Open Multiply Position",
+      Status: TransactionStatus,
+
+      async commit(ctx) {
+        const { loan } = ctx.request;
+        const branch = getBranch(loan.branchId);
+        const { LeverageLSTZapper, CollToken } = branch.contracts;
+
+        const { upperHint, lowerHint } = await getTroveOperationHints({
+          wagmiConfig: ctx.wagmiConfig,
+          contracts: ctx.contracts,
+          branchId: loan.branchId,
+          interestRate: loan.interestRate[0],
+        });
+
+        return withOwnerIndexRetry(ctx.request.ownerIndex, async (ownerIndex) => {
+          const txParams = {
+            owner: loan.borrower,
+            ownerIndex: BigInt(ownerIndex),
+            collAmount: dn.from(ctx.request.initialDeposit, 18)[0],
+            flashLoanAmount: dn.from(ctx.request.flashloanAmount, 18)[0],
+            boldAmount: dn.from(ctx.request.boldAmount, 18)[0],
+            upperHint,
+            lowerHint,
+            annualInterestRate: loan.batchManager ? 0n : loan.interestRate[0],
+            batchManager: loan.batchManager ?? ADDRESS_ZERO,
+            maxUpfrontFee: MAX_UPFRONT_FEE,
+            addManager: ADDRESS_ZERO,
+            removeManager: ADDRESS_ZERO,
+            receiver: ADDRESS_ZERO,
+          };
+
+          return (await sendCalls(ctx.wagmiConfig, {
+            account: ctx.account,
+            calls: [
+              {
+                to: CollToken.address,
+                abi: CollToken.abi,
+                functionName: "approve",
+                args: [
+                  LeverageLSTZapper.address,
+                  ctx.preferredApproveMethod === "approve-infinite"
+                    ? maxUint256
+                    : dn.from(ctx.request.initialDeposit, 18)[0],
+                ],
+              },
+              {
+                to: LeverageLSTZapper.address,
+                abi: LeverageLSTZapper.abi,
+                functionName: "openLeveragedTroveWithRawETH",
+                args: [txParams],
+                value: ETH_GAS_COMPENSATION[0],
+              },
+            ],
+          })).id;
+        });
+      },
+
+      async verify(ctx, hash) {
+        const receipts = await verifyCallsBatch(ctx.wagmiConfig, hash);
+
+        // Extract trove ID from logs
+        const collToken = getCollToken(ctx.request.loan.branchId);
+        if (!collToken) throw new Error("Invalid branch");
+
+        const branch = getBranch(ctx.request.loan.branchId);
+        const [troveOperation] = parseEventLogs({
+          abi: branch.contracts.TroveManager.abi,
+          logs: getCallBatchLogs(receipts),
+          eventName: "TroveOperation",
+        });
+
+        if (!troveOperation?.args?._troveId) {
+          throw new Error("Failed to extract trove ID from transaction");
+        }
+
+        const troveId: TroveId = `0x${troveOperation.args._troveId.toString(16)}`;
+        const prefixedTroveId = getPrefixedTroveId(branch.branchId, troveId);
+
+        addPrefixedTroveIdsToStoredState(ctx.storedState, [prefixedTroveId]);
+
+        ctx.storedState.setState(({ loanModes }) => ({
+          loanModes: {
+            ...loanModes,
+            [prefixedTroveId]: "multiply",
+          },
+        }));
+
+        const subgraphIsDown = subgraphIndicator.hasError();
+        if (!subgraphIsDown) {
+          while (true) {
+            const trove = await getIndexedTroveById(branch.branchId, troveId);
+            if (trove !== null) {
+              break;
+            }
+            await sleep(1000);
+          }
+        }
+      },
+    },
   },
 
   async getSteps(ctx) {
@@ -338,6 +441,12 @@ export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> 
     // ETH doesn't need approval
     if (collToken.symbol === "ETH") {
       return ["openLeveragedTrove"];
+    }
+
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndOpen"];
     }
 
     const branch = getBranch(loan.branchId);

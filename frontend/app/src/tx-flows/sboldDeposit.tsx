@@ -11,7 +11,9 @@ import { InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "sboldDeposit",
@@ -165,9 +167,52 @@ export const sboldDeposit: FlowDeclaration<SboldDepositRequest> = {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe, false);
       },
     },
+
+    batchApproveAndDeposit: {
+      name: () => "Deposit",
+      Status: TransactionStatus,
+
+      async commit({ request, preferredApproveMethod, account, wagmiConfig, contracts }) {
+        const { sboldPosition, prevSboldPosition } = request;
+        const boldChange = sboldPosition.bold[0] - prevSboldPosition.bold[0];
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls: [
+            {
+              to: contracts.BoldToken.address,
+              abi: contracts.BoldToken.abi,
+              functionName: "approve",
+              args: [
+                SboldContract.address,
+                preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : boldChange,
+              ],
+            },
+            {
+              to: SboldContract.address,
+              abi: SboldContract.abi,
+              functionName: "deposit",
+              args: [boldChange, account],
+            },
+          ],
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndDeposit"];
+    }
+
     const { prevSboldPosition, sboldPosition } = ctx.request;
 
     const depositChange = sboldPosition.bold[0] - prevSboldPosition.bold[0];

@@ -15,7 +15,9 @@ import { HFlex, InfoTooltip, TokenIcon, VFlex } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "urgentRedemption",
@@ -176,9 +178,54 @@ export const urgentRedemption: FlowDeclaration<UrgentRedemptionRequest> = {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchApproveAndRedeem: {
+      name: () => content.urgentRedeemScreen.txFlow.redeemStep,
+      Status: TransactionStatus,
+
+      async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
+        const TroveManager = getBranchContract(request.branchId, "TroveManager");
+        const BoldToken = getProtocolContract("BoldToken");
+        const boldAmount = request.boldAmount[0];
+        const minCollateral = request.minCollateral[0];
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls: [
+            {
+              to: BoldToken.address,
+              abi: BoldToken.abi,
+              functionName: "approve",
+              args: [
+                TroveManager.address,
+                preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : boldAmount,
+              ],
+            },
+            {
+              to: TroveManager.address,
+              abi: TroveManager.abi,
+              functionName: "urgentRedemption",
+              args: [boldAmount, request.troveIds.map(BigInt), minCollateral],
+            },
+          ],
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchApproveAndRedeem"];
+    }
+
     const steps: string[] = [];
 
     const TroveManager = getBranchContract(ctx.request.branchId, "TroveManager");
