@@ -18,8 +18,10 @@ import * as dn from "dnum";
 import { match, P } from "ts-pattern";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import type { BranchId, TroveId } from "../types";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "updateLeveragePosition",
@@ -420,9 +422,160 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchUpdateLeverage: {
+      name: ({ request }) => {
+        if (request.leverage) return "Multiply";
+        if (request.depositChange && dn.gt(request.depositChange, 0)) return "Deposit";
+        if (request.depositChange && dn.lt(request.depositChange, 0)) return "Withdraw";
+        return "Update Position";
+      },
+      Status: TransactionStatus,
+
+      async commit({ request, preferredApproveMethod, account, wagmiConfig, readContract }) {
+        const { depositChange, leverage, loan } = request;
+        const branch = getBranch(loan.branchId);
+        const calls: {
+          to: `0x${string}`;
+          abi: readonly unknown[];
+          functionName: string;
+          args: unknown[];
+          value?: bigint;
+        }[] = [];
+
+        // approval for non-ETH collateral deposits
+        if (branch.symbol !== "ETH" && depositChange && dn.gt(depositChange, 0)) {
+          const { LeverageLSTZapper, CollToken } = branch.contracts;
+          const allowance = dnum18(
+            await readContract({
+              ...CollToken,
+              functionName: "allowance",
+              args: [account ?? ADDRESS_ZERO, LeverageLSTZapper.address],
+            }),
+          );
+
+          if (dn.lt(allowance, depositChange)) {
+            calls.push({
+              to: CollToken.address,
+              abi: CollToken.abi,
+              functionName: "approve",
+              args: [
+                LeverageLSTZapper.address,
+                preferredApproveMethod === "approve-infinite"
+                  ? maxUint256
+                  : depositChange[0],
+              ],
+            });
+          }
+        }
+
+        if (leverage?.direction === "down") {
+          const args = [{
+            troveId: BigInt(loan.troveId),
+            flashLoanAmount: dn.from(leverage.flashloanAmount, 18)[0],
+            minBoldAmount: dn.from(leverage.minBoldAmount)[0],
+          }];
+
+          if (branch.symbol === "ETH") {
+            calls.push({
+              to: branch.contracts.LeverageWETHZapper.address,
+              abi: branch.contracts.LeverageWETHZapper.abi,
+              functionName: "leverDownTrove",
+              args,
+            });
+          } else {
+            calls.push({
+              to: branch.contracts.LeverageLSTZapper.address,
+              abi: branch.contracts.LeverageLSTZapper.abi,
+              functionName: "leverDownTrove",
+              args,
+            });
+          }
+        }
+
+        if (depositChange) {
+          if (dn.gt(depositChange, 0)) {
+            if (branch.symbol === "ETH") {
+              calls.push({
+                to: branch.contracts.LeverageWETHZapper.address,
+                abi: branch.contracts.LeverageWETHZapper.abi,
+                functionName: "addCollWithRawETH",
+                args: [BigInt(loan.troveId)],
+                value: depositChange[0],
+              });
+            } else {
+              calls.push({
+                to: branch.contracts.LeverageLSTZapper.address,
+                abi: branch.contracts.LeverageLSTZapper.abi,
+                functionName: "addColl",
+                args: [BigInt(loan.troveId), depositChange[0]],
+              });
+            }
+          } else {
+            const args = [BigInt(loan.troveId), depositChange[0] * -1n];
+
+            if (branch.symbol === "ETH") {
+              calls.push({
+                to: branch.contracts.LeverageWETHZapper.address,
+                abi: branch.contracts.LeverageWETHZapper.abi,
+                functionName: "withdrawCollToRawETH",
+                args,
+              });
+            } else {
+              calls.push({
+                to: branch.contracts.LeverageLSTZapper.address,
+                abi: branch.contracts.LeverageLSTZapper.abi,
+                functionName: "withdrawColl",
+                args,
+              });
+            }
+          }
+        }
+
+        if (leverage?.direction === "up") {
+          const args = [{
+            troveId: BigInt(loan.troveId),
+            flashLoanAmount: dn.from(leverage.flashloanAmount, 18)[0],
+            boldAmount: dn.from(leverage.boldAmount, 18)[0],
+            maxUpfrontFee: MAX_UPFRONT_FEE,
+          }];
+
+          if (branch.symbol === "ETH") {
+            calls.push({
+              to: branch.contracts.LeverageWETHZapper.address,
+              abi: branch.contracts.LeverageWETHZapper.abi,
+              functionName: "leverUpTrove",
+              args,
+            });
+          } else {
+            calls.push({
+              to: branch.contracts.LeverageLSTZapper.address,
+              abi: branch.contracts.LeverageLSTZapper.abi,
+              functionName: "leverUpTrove",
+              args,
+            });
+          }
+        }
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls,
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchUpdateLeverage"];
+    }
+
     const { depositChange, leverage, loan } = ctx.request;
 
     const steps: string[] = [];

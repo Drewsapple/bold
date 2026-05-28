@@ -8,7 +8,9 @@ import { TransactionStatus } from "@/src/screens/TransactionsScreen/TransactionS
 import { vDnum } from "@/src/valibot-utils";
 import { Fragment } from "react";
 import * as v from "valibot";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "legacyEarnWithdrawAll",
@@ -91,11 +93,45 @@ export const legacyEarnWithdrawAll: FlowDeclaration<LegacyEarnWithdrawAllRequest
       withdrawFromStabilityPool7: getWithdrawStep(7),
       withdrawFromStabilityPool8: getWithdrawStep(8),
       withdrawFromStabilityPool9: getWithdrawStep(9),
+
+      batchWithdraw: {
+        name: () => "Withdraw from Legacy Pools",
+        Status: TransactionStatus,
+
+        async commit({ request, account, wagmiConfig }) {
+          const calls = request.pools.map((pool) => {
+            const legacyBranch = LEGACY_CHECK?.BRANCHES[pool.branchIndex];
+            if (!legacyBranch) {
+              throw new Error(`Legacy branch not found: ${pool.branchIndex}`);
+            }
+            return {
+              to: legacyBranch.STABILITY_POOL,
+              abi: StabilityPool,
+              functionName: "withdrawFromSP" as const,
+              args: [pool.deposit[0], true] as const,
+            };
+          });
+
+          return (await sendCalls(wagmiConfig, {
+            account,
+            calls,
+          })).id;
+        },
+
+        async verify(ctx, hash) {
+          await verifyCallsBatch(ctx.wagmiConfig, hash);
+        },
+      },
     }
     : {},
 
-  async getSteps({ request }) {
-    return request.pools.map(
+  async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      return ["batchWithdraw"];
+    }
+
+    return ctx.request.pools.map(
       (pool) => `withdrawFromStabilityPool${pool.branchIndex}`,
     );
   },
