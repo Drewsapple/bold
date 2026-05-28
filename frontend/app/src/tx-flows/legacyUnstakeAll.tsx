@@ -1,4 +1,5 @@
-import type { FlowDeclaration } from "@/src/services/TransactionFlow";
+import type { FlowDeclaration, FlowParams } from "@/src/services/TransactionFlow";
+import type { Address } from "@/src/types";
 
 import { Governance } from "@/src/abi/Governance";
 import { Amount } from "@/src/comps/Amount/Amount";
@@ -6,12 +7,13 @@ import { LEGACY_CHECK } from "@/src/env";
 import { TransactionDetailsRow } from "@/src/screens/TransactionsScreen/TransactionsScreen";
 import { TransactionStatus } from "@/src/screens/TransactionsScreen/TransactionStatus";
 import { usePrice } from "@/src/services/Prices";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { vAddress, vDnum } from "@/src/valibot-utils";
 import * as dn from "dnum";
 import * as v from "valibot";
-import { encodeFunctionData } from "viem";
+import { sendCalls } from "wagmi/actions";
 import { readContracts } from "wagmi/actions";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "legacyUnstakeAll",
@@ -21,6 +23,51 @@ const RequestSchema = createRequestSchema(
 );
 
 export type LegacyUnstakeAllRequest = v.InferOutput<typeof RequestSchema>;
+
+async function getLegacyUnstakeContext(ctx: FlowParams<LegacyUnstakeAllRequest>) {
+  if (!LEGACY_CHECK) {
+    throw new Error("LEGACY_CHECK is not defined");
+  }
+
+  const initiativesFromSnapshotResult = await fetch(LEGACY_CHECK.INITIATIVES_SNAPSHOT_URL).catch((err) => {
+    console.error("Error fetching initiatives from snapshot.");
+    console.error("LEGACY_CHECK.INITIATIVES_SNAPSHOT_URL:", LEGACY_CHECK?.INITIATIVES_SNAPSHOT_URL);
+    throw err;
+  });
+
+  const initiativesFromSnapshot = v.parse(
+    v.array(vAddress()),
+    await initiativesFromSnapshotResult.json(),
+  );
+
+  const lqtyAllocatedByUser = await readContracts(ctx.wagmiConfig, {
+    contracts: initiativesFromSnapshot.map((initiative) => {
+      if (!LEGACY_CHECK) {
+        throw new Error("LEGACY_CHECK is not defined");
+      }
+      return {
+        abi: Governance,
+        address: LEGACY_CHECK.GOVERNANCE,
+        functionName: "lqtyAllocatedByUserToInitiative",
+        args: [ctx.account, initiative],
+      } as const;
+    }),
+    allowFailure: false,
+  });
+
+  const allocatedInitiatives = lqtyAllocatedByUser
+    .map((allocation, index) => {
+      const [voteLQTY, _, vetoLQTY] = allocation;
+      const initiative = initiativesFromSnapshot[index];
+      if (!initiative) {
+        throw new Error("initiative missing");
+      }
+      return voteLQTY > 0n || vetoLQTY > 0n ? initiative : null;
+    })
+    .filter((initiative): initiative is Address => initiative !== null);
+
+  return { allocatedInitiatives };
+}
 
 export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
   title: "Withdraw from Legacy Stake",
@@ -48,7 +95,7 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
   },
 
   steps: {
-    resetVotesAndWithdrawAll: {
+    batchUnstake: {
       name: () => "Unstake",
       Status: TransactionStatus,
       async commit(ctx) {
@@ -56,66 +103,80 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
           throw new Error("LEGACY_CHECK is not defined");
         }
 
-        const inputs: `0x${string}`[] = [];
+        const { allocatedInitiatives } = await getLegacyUnstakeContext(ctx);
 
-        const initiativesFromSnapshotResult = await fetch(LEGACY_CHECK.INITIATIVES_SNAPSHOT_URL).catch((err) => {
-          console.error("Error fetching initiatives from snapshot.");
-          console.error("LEGACY_CHECK.INITIATIVES_SNAPSHOT_URL:", LEGACY_CHECK?.INITIATIVES_SNAPSHOT_URL);
-          throw err;
-        });
+        const calls: Array<{
+          to: Address;
+          abi: typeof Governance;
+          functionName: string;
+          args: unknown[];
+        }> = [];
 
-        const initiativesFromSnapshot = v.parse(
-          v.array(vAddress()),
-          await initiativesFromSnapshotResult.json(),
-        );
-
-        const lqtyAllocatedByUser = await readContracts(ctx.wagmiConfig, {
-          contracts: initiativesFromSnapshot.map((initiative) => {
-            if (!LEGACY_CHECK) {
-              throw new Error("LEGACY_CHECK is not defined");
-            }
-            return {
-              abi: Governance,
-              address: LEGACY_CHECK.GOVERNANCE,
-              functionName: "lqtyAllocatedByUserToInitiative",
-              args: [ctx.account, initiative],
-            } as const;
-          }),
-          allowFailure: false,
-        });
-
-        const allocatedInitiatives = lqtyAllocatedByUser
-          .map((allocation, index) => {
-            const [voteLQTY, _, vetoLQTY] = allocation;
-            const initiative = initiativesFromSnapshot[index];
-            if (!initiative) {
-              throw new Error("initiative missing");
-            }
-            return voteLQTY > 0n || vetoLQTY > 0n ? initiative : null;
-          })
-          .filter((initiative) => initiative !== null);
-
-        // reset allocations if the user has any
         if (allocatedInitiatives.length > 0) {
-          inputs.push(encodeFunctionData({
+          calls.push({
+            to: LEGACY_CHECK.GOVERNANCE,
             abi: Governance,
             functionName: "resetAllocations",
             args: [allocatedInitiatives, true],
-          }));
+          });
         }
 
-        // withdraw all staked LQTY
-        inputs.push(encodeFunctionData({
+        calls.push({
+          to: LEGACY_CHECK.GOVERNANCE,
           abi: Governance,
           functionName: "withdrawLQTY",
           args: [ctx.request.lqtyAmount[0]],
-        }));
+        });
+
+        return (await sendCalls(ctx.wagmiConfig, {
+          account: ctx.account,
+          calls,
+        })).id;
+      },
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
+
+    resetVotes: {
+      name: () => "Reset votes",
+      Status: TransactionStatus,
+      async commit(ctx) {
+        if (!LEGACY_CHECK) {
+          throw new Error("LEGACY_CHECK is not defined");
+        }
+
+        const { allocatedInitiatives } = await getLegacyUnstakeContext(ctx);
+
+        if (allocatedInitiatives.length === 0) {
+          throw new Error("No voting allocations to reset.");
+        }
 
         return ctx.writeContract({
           abi: Governance,
           address: LEGACY_CHECK.GOVERNANCE,
-          functionName: "multiDelegateCall",
-          args: [inputs],
+          functionName: "resetAllocations",
+          args: [allocatedInitiatives, true],
+        });
+      },
+      async verify(ctx, hash) {
+        await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
+      },
+    },
+
+    withdraw: {
+      name: () => "Withdraw",
+      Status: TransactionStatus,
+      async commit(ctx) {
+        if (!LEGACY_CHECK) {
+          throw new Error("LEGACY_CHECK is not defined");
+        }
+
+        return ctx.writeContract({
+          abi: Governance,
+          address: LEGACY_CHECK.GOVERNANCE,
+          functionName: "withdrawLQTY",
+          args: [ctx.request.lqtyAmount[0]],
         });
       },
       async verify(ctx, hash) {
@@ -124,8 +185,21 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
     },
   },
 
-  async getSteps() {
-    return ["resetVotesAndWithdrawAll"];
+  async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+
+    if (caps.supportsBatch) {
+      return ["batchUnstake"];
+    }
+
+    const { allocatedInitiatives } = await getLegacyUnstakeContext(ctx);
+
+    const steps: string[] = [];
+    if (allocatedInitiatives.length > 0) {
+      steps.push("resetVotes");
+    }
+    steps.push("withdraw");
+    return steps;
   },
 
   parseRequest(request) {

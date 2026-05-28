@@ -4,6 +4,7 @@ import type { FlowDeclaration } from "@/src/services/TransactionFlow";
 import { Amount } from "@/src/comps/Amount/Amount";
 import { fmtnum } from "@/src/formatting";
 import { getBranch, getCollToken, getTroveOperationHints, usePredictAdjustTroveUpfrontFee } from "@/src/liquity-utils";
+import type { Contracts } from "@/src/contracts";
 import { LoanCard } from "@/src/screens/TransactionsScreen/LoanCard";
 import { TransactionDetailsRow } from "@/src/screens/TransactionsScreen/TransactionsScreen";
 import { TransactionStatus } from "@/src/screens/TransactionsScreen/TransactionStatus";
@@ -15,7 +16,9 @@ import * as dn from "dnum";
 import { match, P } from "ts-pattern";
 import * as v from "valibot";
 import { maxUint256 } from "viem";
-import { createRequestSchema, verifyTransaction } from "./shared";
+import { sendCalls } from "wagmi/actions";
+import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
+import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
 const RequestSchema = createRequestSchema(
   "updateBorrowPosition",
@@ -444,9 +447,89 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
       },
     },
+
+    batchAdjust: {
+      name: ({ request }) => {
+        const collChange = getCollChange(request.loan, request.prevLoan);
+        const debtChange = getDebtChange(request.loan, request.prevLoan);
+
+        if (!dn.eq(collChange, 0) && !dn.eq(debtChange, 0)) return "Update Position";
+        if (dn.gt(collChange, 0)) return "Deposit Collateral";
+        if (dn.lt(collChange, 0)) return "Withdraw Collateral";
+        if (dn.gt(debtChange, 0)) return "Borrow BOLD";
+        if (dn.lt(debtChange, 0)) return "Repay BOLD";
+
+        return "Update Position";
+      },
+      Status: TransactionStatus,
+
+      async commit({ request, preferredApproveMethod, account, wagmiConfig, contracts }) {
+        const { loan } = request;
+        const collChange = getCollChange(loan, request.prevLoan);
+        const debtChange = getDebtChange(loan, request.prevLoan);
+
+        const branch = getBranch(loan.branchId);
+        const Controller = branch.symbol === "ETH"
+          ? branch.contracts.LeverageWETHZapper
+          : branch.contracts.LeverageLSTZapper;
+
+        const calls: {
+          to: `0x${string}`;
+          abi: readonly unknown[];
+          functionName: string;
+          args: unknown[];
+          value?: bigint;
+        }[] = [];
+
+        if (dn.lt(debtChange, 0)) {
+          calls.push({
+            to: contracts.BoldToken.address,
+            abi: contracts.BoldToken.abi,
+            functionName: "approve",
+            args: [
+              Controller.address,
+              preferredApproveMethod === "approve-infinite"
+                ? maxUint256
+                : dn.abs(debtChange)[0],
+            ],
+          });
+        }
+
+        if (branch.symbol !== "ETH" && dn.gt(collChange, 0)) {
+          calls.push({
+            to: branch.contracts.CollToken.address,
+            abi: branch.contracts.CollToken.abi,
+            functionName: "approve",
+            args: [
+              Controller.address,
+              preferredApproveMethod === "approve-infinite"
+                ? maxUint256
+                : collChange[0],
+            ],
+          });
+        }
+
+        calls.push(await buildActionCall(request, wagmiConfig, contracts));
+
+        return (await sendCalls(wagmiConfig, {
+          account,
+          calls,
+        })).id;
+      },
+
+      async verify(ctx, hash) {
+        await verifyCallsBatch(ctx.wagmiConfig, hash);
+      },
+    },
   },
 
   async getSteps(ctx) {
+    const caps = await getWalletBatchCapabilities(ctx.wagmiConfig);
+    if (caps.supportsBatch) {
+      ctx.preferredApproveMethod = "approve-amount";
+      return ["batchAdjust"];
+    }
+
     const debtChange = getDebtChange(ctx.request.loan, ctx.request.prevLoan);
     const collChange = getCollChange(ctx.request.loan, ctx.request.prevLoan);
 
@@ -528,6 +611,177 @@ function getFinalStep(
 
   // debt decreases => deposit BOLD (repay)
   if (dn.lt(debtChange, 0)) return "depositBold";
+
+  throw new Error("Invalid request");
+}
+
+async function buildActionCall(
+  request: UpdateBorrowPositionRequest,
+  wagmiConfig: Parameters<typeof sendCalls>[0],
+  contracts: Contracts,
+) {
+  const { loan, maxUpfrontFee } = request;
+  const collChange = getCollChange(loan, request.prevLoan);
+  const debtChange = getDebtChange(loan, request.prevLoan);
+  const branch = getBranch(loan.branchId);
+
+  const ethController = branch.contracts.LeverageWETHZapper;
+  const lstController = branch.contracts.LeverageLSTZapper;
+
+  if (loan.isZombie) {
+    const { upperHint, lowerHint } = await getTroveOperationHints({
+      wagmiConfig,
+      contracts,
+      branchId: loan.branchId,
+      interestRate: loan.interestRate[0],
+    });
+
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "adjustZombieTroveWithRawETH",
+        args: [
+          BigInt(loan.troveId),
+          dn.abs(collChange)[0],
+          dn.gt(collChange, 0n),
+          dn.abs(debtChange)[0],
+          dn.gt(debtChange, 0n),
+          upperHint,
+          lowerHint,
+          maxUpfrontFee[0],
+        ],
+        value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "adjustZombieTrove",
+      args: [
+        BigInt(loan.troveId),
+        dn.abs(collChange)[0],
+        dn.gt(collChange, 0n),
+        dn.abs(debtChange)[0],
+        dn.gt(debtChange, 0n),
+        upperHint,
+        lowerHint,
+        maxUpfrontFee[0],
+      ],
+    };
+  }
+
+  // both coll and debt change => adjust trove
+  if (!dn.eq(collChange, 0) && !dn.eq(debtChange, 0)) {
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "adjustTroveWithRawETH",
+        args: [
+          BigInt(loan.troveId),
+          dn.abs(collChange)[0],
+          dn.gt(collChange, 0n),
+          dn.abs(debtChange)[0],
+          dn.gt(debtChange, 0n),
+          maxUpfrontFee[0],
+        ],
+        value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "adjustTrove",
+      args: [
+        BigInt(loan.troveId),
+        dn.abs(collChange)[0],
+        dn.gt(collChange, 0n),
+        dn.abs(debtChange)[0],
+        dn.gt(debtChange, 0n),
+        maxUpfrontFee[0],
+      ],
+    };
+  }
+
+  // coll increases => deposit
+  if (dn.gt(collChange, 0)) {
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "addCollWithRawETH",
+        args: [BigInt(loan.troveId)],
+        value: dn.abs(collChange)[0],
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "addColl",
+      args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+    };
+  }
+
+  // coll decreases => withdraw
+  if (dn.lt(collChange, 0)) {
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "withdrawCollToRawETH",
+        args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "withdrawColl",
+      args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+    };
+  }
+
+  // debt increases => withdraw BOLD (borrow)
+  if (dn.gt(debtChange, 0)) {
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "withdrawBold",
+        args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "withdrawBold",
+      args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
+    };
+  }
+
+  // debt decreases => deposit BOLD (repay)
+  if (dn.lt(debtChange, 0)) {
+    if (branch.symbol === "ETH") {
+      return {
+        to: ethController.address,
+        abi: ethController.abi,
+        functionName: "repayBold",
+        args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
+      };
+    }
+
+    return {
+      to: lstController.address,
+      abi: lstController.abi,
+      functionName: "repayBold",
+      args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
+    };
+  }
 
   throw new Error("Invalid request");
 }

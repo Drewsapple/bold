@@ -12,7 +12,7 @@ import { vDnum, vPositionStake } from "@/src/valibot-utils";
 import { useAccount } from "@/src/wagmi-utils";
 import * as dn from "dnum";
 import * as v from "valibot";
-import { encodeFunctionData, maxUint256 } from "viem";
+import { maxUint256 } from "viem";
 import { getBytecode, sendCalls } from "wagmi/actions";
 import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
@@ -131,13 +131,11 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
       },
     },
 
-    // reset allocations + deposit LQTY in a single transaction
     deposit: {
       name: () => "Stake",
       Status: TransactionStatus,
       async commit(ctx) {
         const { Governance } = ctx.contracts;
-        const inputs: `0x${string}`[] = [];
 
         const approveStep = ctx.steps?.find((step) => step.id === "approve");
         const isPermit = approveStep?.artifact?.startsWith("permit:") === true;
@@ -147,8 +145,8 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
           const { userProxyAddress, ...permit } = JSON.parse(
             approveStep?.artifact?.replace(/^permit:/, "") ?? "{}",
           );
-          inputs.push(encodeFunctionData({
-            abi: Governance.abi,
+          return ctx.writeContract({
+            ...Governance,
             functionName: "depositLQTYViaPermit",
             args: [ctx.request.lqtyAmount[0], {
               owner: ctx.account,
@@ -159,36 +157,30 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
               r: permit.r,
               s: permit.s,
             }],
-          }));
-        } else {
-          const userProxyAddress = await ctx.readContract({
-            ...Governance,
-            functionName: "deriveUserProxyAddress",
-            args: [ctx.account],
           });
-
-          const lqtyAllowance = await ctx.readContract({
-            ...ctx.contracts.LqtyToken,
-            functionName: "allowance",
-            args: [ctx.account, userProxyAddress],
-          });
-
-          if (dn.gt(ctx.request.lqtyAmount, dnum18(lqtyAllowance))) {
-            throw new Error("LQTY allowance is not enough");
-          }
-
-          // deposit approved LQTY
-          inputs.push(encodeFunctionData({
-            abi: Governance.abi,
-            functionName: "depositLQTY",
-            args: [ctx.request.lqtyAmount[0]],
-          }));
         }
 
+        const userProxyAddress = await ctx.readContract({
+          ...Governance,
+          functionName: "deriveUserProxyAddress",
+          args: [ctx.account],
+        });
+
+        const lqtyAllowance = await ctx.readContract({
+          ...ctx.contracts.LqtyToken,
+          functionName: "allowance",
+          args: [ctx.account, userProxyAddress],
+        });
+
+        if (dn.gt(ctx.request.lqtyAmount, dnum18(lqtyAllowance))) {
+          throw new Error("LQTY allowance is not enough");
+        }
+
+        // deposit approved LQTY
         return ctx.writeContract({
           ...Governance,
-          functionName: "multiDelegateCall",
-          args: [inputs],
+          functionName: "depositLQTY",
+          args: [ctx.request.lqtyAmount[0]],
         });
       },
       async verify(ctx, hash) {
