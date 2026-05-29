@@ -1,4 +1,6 @@
 import type { FlowDeclaration } from "@/src/services/TransactionFlow";
+import type { Contracts } from "@/src/contracts";
+import type { Address } from "@/src/types";
 
 import { Amount } from "@/src/comps/Amount/Amount";
 import { SboldPositionSummary } from "@/src/comps/EarnPositionSummary/SboldPositionSummary";
@@ -14,6 +16,38 @@ import { maxUint256 } from "viem";
 import { sendCalls } from "wagmi/actions";
 import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
+
+type SboldContractType = typeof SboldContract;
+
+function buildApproveBoldCall(
+  contracts: Pick<Contracts, "BoldToken">,
+  SboldContract: SboldContractType,
+  preferredApproveMethod: string,
+  boldChange: bigint,
+) {
+  return {
+    ...contracts.BoldToken,
+    functionName: "approve" as const,
+    args: [
+      SboldContract.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256
+        : boldChange,
+    ] as const,
+  };
+}
+
+function buildDepositCall(
+  SboldContract: SboldContractType,
+  boldChange: bigint,
+  account: Address,
+) {
+  return {
+    ...SboldContract,
+    functionName: "deposit" as const,
+    args: [boldChange, account] as const,
+  };
+}
 
 const RequestSchema = createRequestSchema(
   "sboldDeposit",
@@ -136,16 +170,12 @@ export const sboldDeposit: FlowDeclaration<SboldDepositRequest> = {
           ctx.request.sboldPosition.bold,
           ctx.request.prevSboldPosition.bold,
         );
-        return ctx.writeContract({
-          ...ctx.contracts.BoldToken,
-          functionName: "approve",
-          args: [
-            SboldContract.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.abs(depositChange)[0], // exact amount
-          ],
-        });
+        return ctx.writeContract(buildApproveBoldCall(
+          ctx.contracts,
+          SboldContract,
+          ctx.preferredApproveMethod,
+          dn.abs(depositChange)[0],
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe, false);
@@ -157,11 +187,7 @@ export const sboldDeposit: FlowDeclaration<SboldDepositRequest> = {
       async commit({ request, writeContract, account }) {
         const { sboldPosition, prevSboldPosition } = request;
         const boldChange = sboldPosition.bold[0] - prevSboldPosition.bold[0];
-        return writeContract({
-          ...SboldContract,
-          functionName: "deposit",
-          args: [boldChange, account],
-        });
+        return writeContract(buildDepositCall(SboldContract, boldChange, account));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe, false);
@@ -176,27 +202,14 @@ export const sboldDeposit: FlowDeclaration<SboldDepositRequest> = {
         const { sboldPosition, prevSboldPosition } = request;
         const boldChange = sboldPosition.bold[0] - prevSboldPosition.bold[0];
 
+        const calls = [
+          buildApproveBoldCall(contracts, SboldContract, preferredApproveMethod, boldChange),
+          buildDepositCall(SboldContract, boldChange, account),
+        ];
+
         return (await sendCalls(wagmiConfig, {
           account,
-          calls: [
-            {
-              to: contracts.BoldToken.address,
-              abi: contracts.BoldToken.abi,
-              functionName: "approve",
-              args: [
-                SboldContract.address,
-                preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : boldChange,
-              ],
-            },
-            {
-              to: SboldContract.address,
-              abi: SboldContract.abi,
-              functionName: "deposit",
-              args: [boldChange, account],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 

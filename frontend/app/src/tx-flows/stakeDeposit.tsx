@@ -1,4 +1,5 @@
 import type { FlowDeclaration } from "@/src/services/TransactionFlow";
+import type { Address } from "@/src/types";
 
 import { Amount } from "@/src/comps/Amount/Amount";
 import { StakePositionSummary } from "@/src/comps/StakePositionSummary/StakePositionSummary";
@@ -26,6 +27,58 @@ const RequestSchema = createRequestSchema(
 );
 
 export type StakeDepositRequest = v.InferOutput<typeof RequestSchema>;
+
+function buildDeployUserProxyCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+) {
+  return {
+    ...Governance,
+    functionName: "deployUserProxy" as const,
+  };
+}
+
+function buildApproveLqtyCall(
+  LqtyToken: { address: Address; abi: readonly unknown[] },
+  userProxyAddress: Address,
+  amount: bigint,
+) {
+  return {
+    ...LqtyToken,
+    functionName: "approve" as const,
+    args: [userProxyAddress, amount] as const,
+  };
+}
+
+function buildDepositLqtyCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+  amount: bigint,
+) {
+  return {
+    ...Governance,
+    functionName: "depositLQTY" as const,
+    args: [amount] as const,
+  };
+}
+
+function buildDepositLqtyViaPermitCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+  amount: bigint,
+  permit: {
+    owner: Address;
+    spender: Address;
+    value: bigint;
+    deadline: number;
+    v: number;
+    r: `0x${string}`;
+    s: `0x${string}`;
+  },
+) {
+  return {
+    ...Governance,
+    functionName: "depositLQTYViaPermit" as const,
+    args: [amount, permit] as const,
+  };
+}
 
 export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
   title: "Review & Send Transaction",
@@ -66,10 +119,7 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
       name: () => "Initialize Staking",
       Status: TransactionStatus,
       async commit(ctx) {
-        return ctx.writeContract({
-          ...ctx.contracts.Governance,
-          functionName: "deployUserProxy",
-        });
+        return ctx.writeContract(buildDeployUserProxyCall(ctx.contracts.Governance));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -113,16 +163,14 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
         }
 
         // approve()
-        return ctx.writeContract({
-          ...ctx.contracts.LqtyToken,
-          functionName: "approve",
-          args: [
-            userProxyAddress,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : ctx.request.lqtyAmount[0], // exact amount
-          ],
-        });
+        const amount = ctx.preferredApproveMethod === "approve-infinite"
+          ? maxUint256 // infinite approval
+          : ctx.request.lqtyAmount[0]; // exact amount
+        return ctx.writeContract(buildApproveLqtyCall(
+          ctx.contracts.LqtyToken,
+          userProxyAddress,
+          amount,
+        ));
       },
       async verify(ctx, hash) {
         if (!hash.startsWith("permit:")) {
@@ -136,6 +184,7 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
       Status: TransactionStatus,
       async commit(ctx) {
         const { Governance } = ctx.contracts;
+        const amount = ctx.request.lqtyAmount[0];
 
         const approveStep = ctx.steps?.find((step) => step.id === "approve");
         const isPermit = approveStep?.artifact?.startsWith("permit:") === true;
@@ -145,19 +194,19 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
           const { userProxyAddress, ...permit } = JSON.parse(
             approveStep?.artifact?.replace(/^permit:/, "") ?? "{}",
           );
-          return ctx.writeContract({
-            ...Governance,
-            functionName: "depositLQTYViaPermit",
-            args: [ctx.request.lqtyAmount[0], {
+          return ctx.writeContract(buildDepositLqtyViaPermitCall(
+            Governance,
+            amount,
+            {
               owner: ctx.account,
               spender: userProxyAddress,
-              value: ctx.request.lqtyAmount[0],
+              value: amount,
               deadline: permit.deadline,
               v: permit.v,
               r: permit.r,
               s: permit.s,
-            }],
-          });
+            },
+          ));
         }
 
         const userProxyAddress = await ctx.readContract({
@@ -177,11 +226,7 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
         }
 
         // deposit approved LQTY
-        return ctx.writeContract({
-          ...Governance,
-          functionName: "depositLQTY",
-          args: [ctx.request.lqtyAmount[0]],
-        });
+        return ctx.writeContract(buildDepositLqtyCall(Governance, amount));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -194,17 +239,11 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
       Status: TransactionStatus,
       async commit(ctx) {
         const { Governance, LqtyToken } = ctx.contracts;
-        const calls: Array<{
-          to: typeof Governance.address;
-          abi: typeof Governance.abi;
-          functionName: string;
-          args?: unknown[];
-        } | {
-          to: typeof LqtyToken.address;
-          abi: typeof LqtyToken.abi;
-          functionName: string;
-          args: unknown[];
-        }> = [];
+        const calls: ReturnType<
+          | typeof buildDeployUserProxyCall
+          | typeof buildApproveLqtyCall
+          | typeof buildDepositLqtyCall
+        >[] = [];
 
         const userProxyAddress = await ctx.readContract({
           ...Governance,
@@ -218,11 +257,7 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
 
         // deploy proxy if needed
         if (!userProxyBytecode) {
-          calls.push({
-            to: Governance.address,
-            abi: Governance.abi,
-            functionName: "deployUserProxy",
-          });
+          calls.push(buildDeployUserProxyCall(Governance));
         }
 
         // check allowance
@@ -234,25 +269,19 @@ export const stakeDeposit: FlowDeclaration<StakeDepositRequest> = {
 
         // approve if needed
         if (dn.gt(ctx.request.lqtyAmount, dnum18(lqtyAllowance))) {
-          calls.push({
-            to: LqtyToken.address,
-            abi: LqtyToken.abi,
-            functionName: "approve",
-            args: [userProxyAddress, ctx.request.lqtyAmount[0]],
-          });
+          calls.push(buildApproveLqtyCall(
+            LqtyToken,
+            userProxyAddress,
+            ctx.request.lqtyAmount[0],
+          ));
         }
 
         // deposit LQTY
-        calls.push({
-          to: Governance.address,
-          abi: Governance.abi,
-          functionName: "depositLQTY",
-          args: [ctx.request.lqtyAmount[0]],
-        });
+        calls.push(buildDepositLqtyCall(Governance, ctx.request.lqtyAmount[0]));
 
         return (await sendCalls(ctx.wagmiConfig, {
           account: ctx.account,
-          calls,
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
       async verify(ctx, hash) {

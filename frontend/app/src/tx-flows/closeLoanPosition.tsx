@@ -2,6 +2,7 @@ import type { FlowDeclaration } from "@/src/services/TransactionFlow";
 
 import { Amount } from "@/src/comps/Amount/Amount";
 import { ETH_GAS_COMPENSATION } from "@/src/constants";
+import type { Contracts } from "@/src/contracts";
 import { fmtnum } from "@/src/formatting";
 import { subgraphIndicator } from "@/src/indicators/subgraph-indicator";
 import { getBranch, getCollToken } from "@/src/liquity-utils";
@@ -149,20 +150,12 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
           args: [BigInt(loan.troveId)],
         });
 
-        const Zapper = branch.symbol === "ETH"
-          ? branch.contracts.LeverageWETHZapper
-          : branch.contracts.LeverageLSTZapper;
-
-        return ctx.writeContract({
-          ...ctx.contracts.BoldToken,
-          functionName: "approve",
-          args: [
-            Zapper.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.mul([entireDebt, 18], 1.1)[0], // exact amount (TODO: better estimate)
-          ],
-        });
+        return ctx.writeContract(buildApproveBoldCall(
+          ctx.request,
+          ctx.contracts,
+          ctx.preferredApproveMethod,
+          entireDebt,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -175,47 +168,7 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan, repayWithCollateral } = ctx.request;
-        const deposit = dn.from(loan.deposit, 18)[0];
-        const branch = getBranch(loan.branchId);
-
-        // repay with BOLD => get ETH
-        if (!repayWithCollateral && branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "closeTroveToRawETH",
-            args: [BigInt(loan.troveId)],
-          });
-        }
-
-        // repay with BOLD => get LST
-        if (!repayWithCollateral) {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageLSTZapper,
-            functionName: "closeTroveToRawETH",
-            args: [BigInt(loan.troveId)],
-          });
-        }
-
-        // from here, we are repaying with the collateral
-
-        const closeFlashLoanAmount = dn.from(repayWithCollateral.flashLoanAmount, 18)[0];
-
-        // repay with collateral => get ETH
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "closeTroveFromCollateral",
-            args: [BigInt(loan.troveId), closeFlashLoanAmount, deposit - closeFlashLoanAmount],
-          });
-        }
-
-        // repay with collateral => get LST
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "closeTroveFromCollateral",
-          args: [BigInt(loan.troveId), closeFlashLoanAmount, deposit - closeFlashLoanAmount],
-        });
+        return ctx.writeContract(buildCloseTroveCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -244,37 +197,20 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
         const { loan } = ctx.request;
         const branch = getBranch(loan.branchId);
 
-        const Zapper = branch.symbol === "ETH"
-          ? branch.contracts.LeverageWETHZapper
-          : branch.contracts.LeverageLSTZapper;
-
         const { entireDebt } = await readContract(ctx.wagmiConfig, {
           ...branch.contracts.TroveManager,
           functionName: "getLatestTroveData",
           args: [BigInt(loan.troveId)],
         });
 
+        const calls = [
+          buildApproveBoldCall(ctx.request, ctx.contracts, ctx.preferredApproveMethod, entireDebt),
+          buildCloseTroveCall(ctx.request),
+        ];
+
         return (await sendCalls(ctx.wagmiConfig, {
           account: ctx.account,
-          calls: [
-            {
-              to: ctx.contracts.BoldToken.address,
-              abi: ctx.contracts.BoldToken.abi,
-              functionName: "approve",
-              args: [
-                Zapper.address,
-                ctx.preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : dn.mul([entireDebt, 18], 1.1)[0],
-              ],
-            },
-            {
-              to: Zapper.address,
-              abi: Zapper.abi,
-              functionName: "closeTroveToRawETH",
-              args: [BigInt(loan.troveId)],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 
@@ -340,3 +276,60 @@ export const closeLoanPosition: FlowDeclaration<CloseLoanPositionRequest> = {
     return v.parse(RequestSchema, request);
   },
 };
+
+function buildApproveBoldCall(
+  request: CloseLoanPositionRequest,
+  contracts: Contracts,
+  preferredApproveMethod: "permit" | "approve-amount" | "approve-infinite",
+  entireDebt: bigint,
+) {
+  const branch = getBranch(request.loan.branchId);
+  const Zapper = branch.symbol === "ETH"
+    ? branch.contracts.LeverageWETHZapper
+    : branch.contracts.LeverageLSTZapper;
+
+  return {
+    ...contracts.BoldToken,
+    functionName: "approve" as const,
+    args: [
+      Zapper.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256 // infinite approval
+        : dn.mul([entireDebt, 18], 1.1)[0], // exact amount (TODO: better estimate)
+    ] as const,
+  };
+}
+
+function buildCloseTroveCall(request: CloseLoanPositionRequest) {
+  const { loan, repayWithCollateral } = request;
+  const deposit = dn.from(loan.deposit, 18)[0];
+  const branch = getBranch(loan.branchId);
+
+  if (!repayWithCollateral) {
+    const Zapper = branch.symbol === "ETH"
+      ? branch.contracts.LeverageWETHZapper
+      : branch.contracts.LeverageLSTZapper;
+
+    return {
+      ...Zapper,
+      functionName: "closeTroveToRawETH" as const,
+      args: [BigInt(loan.troveId)] as const,
+    };
+  }
+
+  const closeFlashLoanAmount = dn.from(repayWithCollateral.flashLoanAmount, 18)[0];
+
+  if (branch.symbol === "ETH") {
+    return {
+      ...branch.contracts.LeverageWETHZapper,
+      functionName: "closeTroveFromCollateral" as const,
+      args: [BigInt(loan.troveId), closeFlashLoanAmount, deposit - closeFlashLoanAmount] as const,
+    };
+  }
+
+  return {
+    ...branch.contracts.LeverageLSTZapper,
+    functionName: "closeTroveFromCollateral" as const,
+    args: [BigInt(loan.troveId), closeFlashLoanAmount, deposit - closeFlashLoanAmount] as const,
+  };
+}

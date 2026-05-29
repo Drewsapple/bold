@@ -154,24 +154,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
         />
       ),
       async commit(ctx) {
-        const debtChange = getDebtChange(ctx.request.loan, ctx.request.prevLoan);
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        const Controller = branch.symbol === "ETH"
-          ? branch.contracts.LeverageWETHZapper
-          : branch.contracts.LeverageLSTZapper;
-
-        return ctx.writeContract({
-          ...ctx.contracts.BoldToken,
-          functionName: "approve",
-          args: [
-            Controller.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.abs(debtChange)[0], // exact amount
-          ],
-        });
+        return ctx.writeContract(buildApproveBoldCall(
+          ctx.request,
+          ctx.contracts,
+          ctx.preferredApproveMethod,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -190,22 +177,10 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
         />
       ),
       async commit(ctx) {
-        const collChange = getCollChange(ctx.request.loan, ctx.request.prevLoan);
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        const Controller = branch.contracts.LeverageLSTZapper;
-
-        return ctx.writeContract({
-          ...branch.contracts.CollToken,
-          functionName: "approve",
-          args: [
-            Controller.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.abs(collChange)[0], // exact amount
-          ],
-        });
+        return ctx.writeContract(buildApproveCollCall(
+          ctx.request,
+          ctx.preferredApproveMethod,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -218,40 +193,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan, maxUpfrontFee } = ctx.request;
-        const collChange = getCollChange(loan, ctx.request.prevLoan);
-        const debtChange = getDebtChange(loan, ctx.request.prevLoan);
-
-        const branch = getBranch(loan.branchId);
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "adjustTroveWithRawETH",
-            args: [
-              BigInt(loan.troveId),
-              dn.abs(collChange)[0],
-              dn.gt(collChange, 0n),
-              dn.abs(debtChange)[0],
-              dn.gt(debtChange, 0n),
-              maxUpfrontFee[0],
-            ],
-            value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "adjustTrove",
-          args: [
-            BigInt(loan.troveId),
-            dn.abs(collChange)[0],
-            dn.gt(collChange, 0n),
-            dn.abs(debtChange)[0],
-            dn.gt(debtChange, 0n),
-            maxUpfrontFee[0],
-          ],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -277,51 +223,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan, maxUpfrontFee } = ctx.request;
-        const collChange = getCollChange(loan, ctx.request.prevLoan);
-        const debtChange = getDebtChange(loan, ctx.request.prevLoan);
-
-        const branch = getBranch(loan.branchId);
-
-        const { upperHint, lowerHint } = await getTroveOperationHints({
-          wagmiConfig: ctx.wagmiConfig,
-          contracts: ctx.contracts,
-          branchId: loan.branchId,
-          interestRate: loan.interestRate[0],
-        });
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "adjustZombieTroveWithRawETH",
-            args: [
-              BigInt(loan.troveId),
-              dn.abs(collChange)[0],
-              dn.gt(collChange, 0n),
-              dn.abs(debtChange)[0],
-              dn.gt(debtChange, 0n),
-              upperHint,
-              lowerHint,
-              maxUpfrontFee[0],
-            ],
-            value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "adjustZombieTrove",
-          args: [
-            BigInt(loan.troveId),
-            dn.abs(collChange)[0],
-            dn.gt(collChange, 0n),
-            dn.abs(debtChange)[0],
-            dn.gt(debtChange, 0n),
-            upperHint,
-            lowerHint,
-            maxUpfrontFee[0],
-          ],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -334,24 +240,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const debtChange = getDebtChange(loan, ctx.request.prevLoan);
-
-        const branch = getBranch(loan.branchId);
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "repayBold",
-            args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "repayBold",
-          args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -364,25 +257,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const collChange = getCollChange(loan, ctx.request.prevLoan);
-
-        const branch = getBranch(loan.branchId);
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "addCollWithRawETH",
-            args: [BigInt(loan.troveId)],
-            value: dn.abs(collChange)[0],
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "addColl",
-          args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -395,23 +274,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan, maxUpfrontFee } = ctx.request;
-        const debtChange = getDebtChange(loan, ctx.request.prevLoan);
-        const branch = getBranch(loan.branchId);
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "withdrawBold",
-            args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "withdrawBold",
-          args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -424,23 +291,11 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const collChange = getCollChange(loan, ctx.request.prevLoan);
-        const branch = getBranch(loan.branchId);
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "withdrawCollToRawETH",
-            args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "withdrawColl",
-          args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
-        });
+        return ctx.writeContract(await buildActionCall(
+          ctx.request,
+          ctx.wagmiConfig,
+          ctx.contracts,
+        ));
       },
 
       async verify(ctx, hash) {
@@ -468,52 +323,27 @@ export const updateBorrowPosition: FlowDeclaration<UpdateBorrowPositionRequest> 
         const collChange = getCollChange(loan, request.prevLoan);
         const debtChange = getDebtChange(loan, request.prevLoan);
 
-        const branch = getBranch(loan.branchId);
-        const Controller = branch.symbol === "ETH"
-          ? branch.contracts.LeverageWETHZapper
-          : branch.contracts.LeverageLSTZapper;
-
-        const calls: {
-          to: `0x${string}`;
+        const calls = [] as Array<{
+          address: `0x${string}`;
           abi: readonly unknown[];
           functionName: string;
-          args: unknown[];
+          args: readonly unknown[];
           value?: bigint;
-        }[] = [];
+        }>;
 
         if (dn.lt(debtChange, 0)) {
-          calls.push({
-            to: contracts.BoldToken.address,
-            abi: contracts.BoldToken.abi,
-            functionName: "approve",
-            args: [
-              Controller.address,
-              preferredApproveMethod === "approve-infinite"
-                ? maxUint256
-                : dn.abs(debtChange)[0],
-            ],
-          });
+          calls.push(buildApproveBoldCall(request, contracts, preferredApproveMethod));
         }
 
-        if (branch.symbol !== "ETH" && dn.gt(collChange, 0)) {
-          calls.push({
-            to: branch.contracts.CollToken.address,
-            abi: branch.contracts.CollToken.abi,
-            functionName: "approve",
-            args: [
-              Controller.address,
-              preferredApproveMethod === "approve-infinite"
-                ? maxUint256
-                : collChange[0],
-            ],
-          });
+        if (getBranch(loan.branchId).symbol !== "ETH" && dn.gt(collChange, 0)) {
+          calls.push(buildApproveCollCall(request, preferredApproveMethod));
         }
 
         calls.push(await buildActionCall(request, wagmiConfig, contracts));
 
         return (await sendCalls(wagmiConfig, {
           account,
-          calls,
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 
@@ -615,6 +445,50 @@ function getFinalStep(
   throw new Error("Invalid request");
 }
 
+function buildApproveBoldCall(
+  request: UpdateBorrowPositionRequest,
+  contracts: Contracts,
+  preferredApproveMethod: "permit" | "approve-amount" | "approve-infinite",
+) {
+  const debtChange = getDebtChange(request.loan, request.prevLoan);
+  const branch = getBranch(request.loan.branchId);
+
+  const Controller = branch.symbol === "ETH"
+    ? branch.contracts.LeverageWETHZapper
+    : branch.contracts.LeverageLSTZapper;
+
+  return {
+    ...contracts.BoldToken,
+    functionName: "approve" as const,
+    args: [
+      Controller.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256 // infinite approval
+        : dn.abs(debtChange)[0], // exact amount
+    ] as const,
+  };
+}
+
+function buildApproveCollCall(
+  request: UpdateBorrowPositionRequest,
+  preferredApproveMethod: "permit" | "approve-amount" | "approve-infinite",
+) {
+  const collChange = getCollChange(request.loan, request.prevLoan);
+  const branch = getBranch(request.loan.branchId);
+  const Controller = branch.contracts.LeverageLSTZapper;
+
+  return {
+    ...branch.contracts.CollToken,
+    functionName: "approve" as const,
+    args: [
+      Controller.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256 // infinite approval
+        : dn.abs(collChange)[0], // exact amount
+    ] as const,
+  };
+}
+
 async function buildActionCall(
   request: UpdateBorrowPositionRequest,
   wagmiConfig: Parameters<typeof sendCalls>[0],
@@ -638,9 +512,8 @@ async function buildActionCall(
 
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "adjustZombieTroveWithRawETH",
+        ...ethController,
+        functionName: "adjustZombieTroveWithRawETH" as const,
         args: [
           BigInt(loan.troveId),
           dn.abs(collChange)[0],
@@ -650,15 +523,14 @@ async function buildActionCall(
           upperHint,
           lowerHint,
           maxUpfrontFee[0],
-        ],
+        ] as const,
         value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "adjustZombieTrove",
+      ...lstController,
+      functionName: "adjustZombieTrove" as const,
       args: [
         BigInt(loan.troveId),
         dn.abs(collChange)[0],
@@ -668,7 +540,7 @@ async function buildActionCall(
         upperHint,
         lowerHint,
         maxUpfrontFee[0],
-      ],
+      ] as const,
     };
   }
 
@@ -676,9 +548,8 @@ async function buildActionCall(
   if (!dn.eq(collChange, 0) && !dn.eq(debtChange, 0)) {
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "adjustTroveWithRawETH",
+        ...ethController,
+        functionName: "adjustTroveWithRawETH" as const,
         args: [
           BigInt(loan.troveId),
           dn.abs(collChange)[0],
@@ -686,15 +557,14 @@ async function buildActionCall(
           dn.abs(debtChange)[0],
           dn.gt(debtChange, 0n),
           maxUpfrontFee[0],
-        ],
+        ] as const,
         value: dn.gt(collChange, 0n) ? collChange[0] : 0n,
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "adjustTrove",
+      ...lstController,
+      functionName: "adjustTrove" as const,
       args: [
         BigInt(loan.troveId),
         dn.abs(collChange)[0],
@@ -702,7 +572,7 @@ async function buildActionCall(
         dn.abs(debtChange)[0],
         dn.gt(debtChange, 0n),
         maxUpfrontFee[0],
-      ],
+      ] as const,
     };
   }
 
@@ -710,19 +580,17 @@ async function buildActionCall(
   if (dn.gt(collChange, 0)) {
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "addCollWithRawETH",
-        args: [BigInt(loan.troveId)],
+        ...ethController,
+        functionName: "addCollWithRawETH" as const,
+        args: [BigInt(loan.troveId)] as const,
         value: dn.abs(collChange)[0],
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "addColl",
-      args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+      ...lstController,
+      functionName: "addColl" as const,
+      args: [BigInt(loan.troveId), dn.abs(collChange)[0]] as const,
     };
   }
 
@@ -730,18 +598,16 @@ async function buildActionCall(
   if (dn.lt(collChange, 0)) {
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "withdrawCollToRawETH",
-        args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+        ...ethController,
+        functionName: "withdrawCollToRawETH" as const,
+        args: [BigInt(loan.troveId), dn.abs(collChange)[0]] as const,
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "withdrawColl",
-      args: [BigInt(loan.troveId), dn.abs(collChange)[0]],
+      ...lstController,
+      functionName: "withdrawColl" as const,
+      args: [BigInt(loan.troveId), dn.abs(collChange)[0]] as const,
     };
   }
 
@@ -749,18 +615,16 @@ async function buildActionCall(
   if (dn.gt(debtChange, 0)) {
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "withdrawBold",
-        args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
+        ...ethController,
+        functionName: "withdrawBold" as const,
+        args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]] as const,
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "withdrawBold",
-      args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]],
+      ...lstController,
+      functionName: "withdrawBold" as const,
+      args: [BigInt(loan.troveId), dn.abs(debtChange)[0], maxUpfrontFee[0]] as const,
     };
   }
 
@@ -768,18 +632,16 @@ async function buildActionCall(
   if (dn.lt(debtChange, 0)) {
     if (branch.symbol === "ETH") {
       return {
-        to: ethController.address,
-        abi: ethController.abi,
-        functionName: "repayBold",
-        args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
+        ...ethController,
+        functionName: "repayBold" as const,
+        args: [BigInt(loan.troveId), dn.abs(debtChange)[0]] as const,
       };
     }
 
     return {
-      to: lstController.address,
-      abi: lstController.abi,
-      functionName: "repayBold",
-      args: [BigInt(loan.troveId), dn.abs(debtChange)[0]],
+      ...lstController,
+      functionName: "repayBold" as const,
+      args: [BigInt(loan.troveId), dn.abs(debtChange)[0]] as const,
     };
   }
 

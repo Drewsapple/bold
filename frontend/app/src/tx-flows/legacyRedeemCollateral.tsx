@@ -18,6 +18,42 @@ import { sendCalls } from "wagmi/actions";
 import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
+function buildApproveCall(
+  request: LegacyRedeemCollateralRequest,
+  preferredApproveMethod: string,
+) {
+  if (!LEGACY_CHECK) {
+    throw new Error("LEGACY_CHECK is not defined");
+  }
+  return {
+    abi: erc20Abi,
+    address: LEGACY_CHECK.BOLD_TOKEN,
+    functionName: "approve" as const,
+    args: [
+      LEGACY_CHECK.COLLATERAL_REGISTRY,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256
+        : request.amount[0],
+    ] as const,
+  };
+}
+
+function buildRedeemCall(request: LegacyRedeemCollateralRequest) {
+  if (!LEGACY_CHECK) {
+    throw new Error("LEGACY_CHECK is not defined");
+  }
+  return {
+    abi: CollateralRegistry,
+    address: LEGACY_CHECK.COLLATERAL_REGISTRY,
+    functionName: "redeemCollateral" as const,
+    args: [
+      request.amount[0],
+      0n,
+      request.maxFee[0],
+    ] as const,
+  };
+}
+
 const RequestSchema = createRequestSchema(
   "legacyRedeemCollateral",
   {
@@ -90,16 +126,8 @@ export const legacyRedeemCollateral: FlowDeclaration<LegacyRedeemCollateralReque
     approve: {
       name: () => "Approve BOLD",
       Status: TransactionStatus,
-      async commit({ request, writeContract }) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
-        return writeContract({
-          abi: erc20Abi,
-          address: LEGACY_CHECK.BOLD_TOKEN,
-          functionName: "approve",
-          args: [LEGACY_CHECK.COLLATERAL_REGISTRY, request.amount[0]],
-        });
+      async commit({ request, preferredApproveMethod, writeContract }) {
+        return writeContract(buildApproveCall(request, preferredApproveMethod));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -109,19 +137,7 @@ export const legacyRedeemCollateral: FlowDeclaration<LegacyRedeemCollateralReque
       name: () => "Redeem BOLD",
       Status: TransactionStatus,
       async commit({ request, writeContract }) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
-        return writeContract({
-          abi: CollateralRegistry,
-          address: LEGACY_CHECK.COLLATERAL_REGISTRY,
-          functionName: "redeemCollateral",
-          args: [
-            request.amount[0],
-            0n,
-            request.maxFee[0],
-          ],
-        });
+        return writeContract(buildRedeemCall(request));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -132,35 +148,14 @@ export const legacyRedeemCollateral: FlowDeclaration<LegacyRedeemCollateralReque
       name: () => "Redeem BOLD",
       Status: TransactionStatus,
       async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
+        const calls = [
+          buildApproveCall(request, preferredApproveMethod),
+          buildRedeemCall(request),
+        ];
 
         return (await sendCalls(wagmiConfig, {
           account,
-          calls: [
-            {
-              to: LEGACY_CHECK.BOLD_TOKEN,
-              abi: erc20Abi,
-              functionName: "approve",
-              args: [
-                LEGACY_CHECK.COLLATERAL_REGISTRY,
-                preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : request.amount[0],
-              ],
-            },
-            {
-              to: LEGACY_CHECK.COLLATERAL_REGISTRY,
-              abi: CollateralRegistry,
-              functionName: "redeemCollateral",
-              args: [
-                request.amount[0],
-                0n,
-                request.maxFee[0],
-              ],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
       async verify(ctx, hash) {

@@ -69,6 +69,30 @@ async function getLegacyUnstakeContext(ctx: FlowParams<LegacyUnstakeAllRequest>)
   return { allocatedInitiatives };
 }
 
+function buildResetVotesCall(allocatedInitiatives: Address[]) {
+  if (!LEGACY_CHECK) {
+    throw new Error("LEGACY_CHECK is not defined");
+  }
+  return {
+    abi: Governance,
+    address: LEGACY_CHECK.GOVERNANCE,
+    functionName: "resetAllocations" as const,
+    args: [allocatedInitiatives, true] as const,
+  };
+}
+
+function buildWithdrawCall(lqtyAmount: bigint) {
+  if (!LEGACY_CHECK) {
+    throw new Error("LEGACY_CHECK is not defined");
+  }
+  return {
+    abi: Governance,
+    address: LEGACY_CHECK.GOVERNANCE,
+    functionName: "withdrawLQTY" as const,
+    args: [lqtyAmount] as const,
+  };
+}
+
 export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
   title: "Withdraw from Legacy Stake",
   Summary: null,
@@ -99,38 +123,19 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
       name: () => "Unstake",
       Status: TransactionStatus,
       async commit(ctx) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
-
         const { allocatedInitiatives } = await getLegacyUnstakeContext(ctx);
 
-        const calls: Array<{
-          to: Address;
-          abi: typeof Governance;
-          functionName: string;
-          args: unknown[];
-        }> = [];
+        const calls: ReturnType<typeof buildResetVotesCall | typeof buildWithdrawCall>[] = [];
 
         if (allocatedInitiatives.length > 0) {
-          calls.push({
-            to: LEGACY_CHECK.GOVERNANCE,
-            abi: Governance,
-            functionName: "resetAllocations",
-            args: [allocatedInitiatives, true],
-          });
+          calls.push(buildResetVotesCall(allocatedInitiatives));
         }
 
-        calls.push({
-          to: LEGACY_CHECK.GOVERNANCE,
-          abi: Governance,
-          functionName: "withdrawLQTY",
-          args: [ctx.request.lqtyAmount[0]],
-        });
+        calls.push(buildWithdrawCall(ctx.request.lqtyAmount[0]));
 
         return (await sendCalls(ctx.wagmiConfig, {
           account: ctx.account,
-          calls,
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
       async verify(ctx, hash) {
@@ -142,22 +147,13 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
       name: () => "Reset votes",
       Status: TransactionStatus,
       async commit(ctx) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
-
         const { allocatedInitiatives } = await getLegacyUnstakeContext(ctx);
 
         if (allocatedInitiatives.length === 0) {
           throw new Error("No voting allocations to reset.");
         }
 
-        return ctx.writeContract({
-          abi: Governance,
-          address: LEGACY_CHECK.GOVERNANCE,
-          functionName: "resetAllocations",
-          args: [allocatedInitiatives, true],
-        });
+        return ctx.writeContract(buildResetVotesCall(allocatedInitiatives));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -168,16 +164,7 @@ export const legacyUnstakeAll: FlowDeclaration<LegacyUnstakeAllRequest> = {
       name: () => "Withdraw",
       Status: TransactionStatus,
       async commit(ctx) {
-        if (!LEGACY_CHECK) {
-          throw new Error("LEGACY_CHECK is not defined");
-        }
-
-        return ctx.writeContract({
-          abi: Governance,
-          address: LEGACY_CHECK.GOVERNANCE,
-          functionName: "withdrawLQTY",
-          args: [ctx.request.lqtyAmount[0]],
-        });
+        return ctx.writeContract(buildWithdrawCall(ctx.request.lqtyAmount[0]));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);

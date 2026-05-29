@@ -17,6 +17,42 @@ import { getWalletBatchCapabilities } from "@/src/sendCalls-utils";
 import { REDEMPTION_SLIPPAGE_TOLERANCE } from "../constants";
 import { createRequestSchema, verifyCallsBatch, verifyTransaction } from "./shared";
 
+function buildApproveCall(
+  request: RedeemCollateralRequest,
+  preferredApproveMethod: string,
+) {
+  const RedemptionHelper = getProtocolContract("RedemptionHelper");
+  const BoldToken = getProtocolContract("BoldToken");
+
+  return {
+    ...BoldToken,
+    functionName: "approve" as const,
+    args: [
+      RedemptionHelper.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256
+        : request.amount[0],
+    ] as const,
+  };
+}
+
+function buildRedeemCall(request: RedeemCollateralRequest) {
+  const bold = dn.from(request.amount, 18)[0];
+  const maxIterationsPerCollateral = BigInt(request.maxIterationsPerCollateral);
+  const maxFeePct = dn.add(request.feePct, request.slippageTolerance, 18)[0];
+  const slippageFactor = dn.sub(DNUM_1, request.slippageTolerance);
+  const minCollRedeemed = request.collRedeemed.map((collRedeemed) =>
+    dn.mul(collRedeemed, slippageFactor, 18)[0]
+  );
+  const RedemptionHelper = getProtocolContract("RedemptionHelper");
+
+  return {
+    ...RedemptionHelper,
+    functionName: "redeemCollateral" as const,
+    args: [bold, maxIterationsPerCollateral, maxFeePct, minCollRedeemed] as const,
+  };
+}
+
 const RequestSchema = createRequestSchema(
   "redeemCollateral",
   {
@@ -109,19 +145,7 @@ export const redeemCollateral: FlowDeclaration<RedeemCollateralRequest> = {
       Status: (props) => <TransactionStatus {...props} approval="approve-only" />,
 
       async commit({ request, writeContract, preferredApproveMethod }) {
-        const RedemptionHelper = getProtocolContract("RedemptionHelper");
-        const BoldToken = getProtocolContract("BoldToken");
-
-        return writeContract({
-          ...BoldToken,
-          functionName: "approve",
-          args: [
-            RedemptionHelper.address,
-            preferredApproveMethod === "approve-infinite"
-              ? maxUint256
-              : request.amount[0],
-          ],
-        });
+        return writeContract(buildApproveCall(request, preferredApproveMethod));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -133,18 +157,7 @@ export const redeemCollateral: FlowDeclaration<RedeemCollateralRequest> = {
       Status: TransactionStatus,
 
       async commit({ request, writeContract }) {
-        const bold = dn.from(request.amount, 18)[0];
-        const maxIterationsPerCollateral = BigInt(request.maxIterationsPerCollateral);
-        const maxFeePct = dn.add(request.feePct, request.slippageTolerance, 18)[0];
-        const slippageFactor = dn.sub(DNUM_1, request.slippageTolerance);
-        const minCollRedeemed = request.collRedeemed.map((collRedeemed) => dn.mul(collRedeemed, slippageFactor, 18)[0]);
-        const RedemptionHelper = getProtocolContract("RedemptionHelper");
-
-        return writeContract({
-          ...RedemptionHelper,
-          functionName: "redeemCollateral",
-          args: [bold, maxIterationsPerCollateral, maxFeePct, minCollRedeemed],
-        });
+        return writeContract(buildRedeemCall(request));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -156,35 +169,14 @@ export const redeemCollateral: FlowDeclaration<RedeemCollateralRequest> = {
       Status: TransactionStatus,
 
       async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
-        const bold = dn.from(request.amount, 18)[0];
-        const maxIterationsPerCollateral = BigInt(request.maxIterationsPerCollateral);
-        const maxFeePct = dn.add(request.feePct, request.slippageTolerance, 18)[0];
-        const slippageFactor = dn.sub(DNUM_1, request.slippageTolerance);
-        const minCollRedeemed = request.collRedeemed.map((collRedeemed) => dn.mul(collRedeemed, slippageFactor, 18)[0]);
-        const RedemptionHelper = getProtocolContract("RedemptionHelper");
-        const BoldToken = getProtocolContract("BoldToken");
+        const calls = [
+          buildApproveCall(request, preferredApproveMethod),
+          buildRedeemCall(request),
+        ];
 
         return (await sendCalls(wagmiConfig, {
           account,
-          calls: [
-            {
-              to: BoldToken.address,
-              abi: BoldToken.abi,
-              functionName: "approve",
-              args: [
-                RedemptionHelper.address,
-                preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : bold,
-              ],
-            },
-            {
-              to: RedemptionHelper.address,
-              abi: RedemptionHelper.abi,
-              functionName: "redeemCollateral",
-              args: [bold, maxIterationsPerCollateral, maxFeePct, minCollRedeemed],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 

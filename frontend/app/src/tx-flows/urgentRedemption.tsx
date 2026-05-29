@@ -33,6 +33,39 @@ const RequestSchema = createRequestSchema(
 
 export type UrgentRedemptionRequest = v.InferOutput<typeof RequestSchema>;
 
+function buildApproveCall(
+  request: UrgentRedemptionRequest,
+  preferredApproveMethod: string,
+) {
+  const TroveManager = getBranchContract(request.branchId, "TroveManager");
+  const BoldToken = getProtocolContract("BoldToken");
+
+  return {
+    ...BoldToken,
+    functionName: "approve" as const,
+    args: [
+      TroveManager.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256
+        : request.boldAmount[0],
+    ] as const,
+  };
+}
+
+function buildUrgentRedemptionCall(
+  request: UrgentRedemptionRequest,
+) {
+  const TroveManager = getBranchContract(request.branchId, "TroveManager");
+  const boldAmount = request.boldAmount[0];
+  const minCollateral = request.minCollateral[0];
+
+  return {
+    ...TroveManager,
+    functionName: "urgentRedemption" as const,
+    args: [boldAmount, request.troveIds.map(BigInt), minCollateral] as const,
+  };
+}
+
 export const urgentRedemption: FlowDeclaration<UrgentRedemptionRequest> = {
   title: content.urgentRedeemScreen.txFlow.title,
   Summary: () => null,
@@ -140,19 +173,7 @@ export const urgentRedemption: FlowDeclaration<UrgentRedemptionRequest> = {
       Status: (props) => <TransactionStatus {...props} approval="approve-only" />,
 
       async commit({ request, writeContract, preferredApproveMethod }) {
-        const TroveManager = getBranchContract(request.branchId, "TroveManager");
-        const BoldToken = getProtocolContract("BoldToken");
-
-        return writeContract({
-          ...BoldToken,
-          functionName: "approve",
-          args: [
-            TroveManager.address,
-            preferredApproveMethod === "approve-infinite"
-              ? maxUint256
-              : request.boldAmount[0],
-          ],
-        });
+        return writeContract(buildApproveCall(request, preferredApproveMethod));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -164,15 +185,7 @@ export const urgentRedemption: FlowDeclaration<UrgentRedemptionRequest> = {
       Status: TransactionStatus,
 
       async commit({ request, writeContract }) {
-        const TroveManager = getBranchContract(request.branchId, "TroveManager");
-        const boldAmount = request.boldAmount[0];
-        const minCollateral = request.minCollateral[0];
-
-        return writeContract({
-          ...TroveManager,
-          functionName: "urgentRedemption",
-          args: [boldAmount, request.troveIds.map(BigInt), minCollateral],
-        });
+        return writeContract(buildUrgentRedemptionCall(request));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -184,32 +197,14 @@ export const urgentRedemption: FlowDeclaration<UrgentRedemptionRequest> = {
       Status: TransactionStatus,
 
       async commit({ request, preferredApproveMethod, account, wagmiConfig }) {
-        const TroveManager = getBranchContract(request.branchId, "TroveManager");
-        const BoldToken = getProtocolContract("BoldToken");
-        const boldAmount = request.boldAmount[0];
-        const minCollateral = request.minCollateral[0];
+        const calls = [
+          buildApproveCall(request, preferredApproveMethod),
+          buildUrgentRedemptionCall(request),
+        ];
 
         return (await sendCalls(wagmiConfig, {
           account,
-          calls: [
-            {
-              to: BoldToken.address,
-              abi: BoldToken.abi,
-              functionName: "approve",
-              args: [
-                TroveManager.address,
-                preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : boldAmount,
-              ],
-            },
-            {
-              to: TroveManager.address,
-              abi: TroveManager.abi,
-              functionName: "urgentRedemption",
-              args: [boldAmount, request.troveIds.map(BigInt), minCollateral],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 

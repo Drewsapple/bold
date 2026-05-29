@@ -251,23 +251,10 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
         />
       ),
       async commit(ctx) {
-        if (!ctx.request.depositChange) {
-          throw new Error("Invalid step: depositChange is required with approveLst");
-        }
-
-        const branch = getBranch(ctx.request.loan.branchId);
-        const Zapper = branch.contracts.LeverageLSTZapper;
-
-        return ctx.writeContract({
-          ...branch.contracts.CollToken,
-          functionName: "approve",
-          args: [
-            Zapper.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : ctx.request.depositChange[0], // exact amount
-          ],
-        });
+        return ctx.writeContract(await buildApproveLstCall(
+          ctx.request,
+          ctx.preferredApproveMethod,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -279,28 +266,7 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
       Status: TransactionStatus,
 
       async commit(ctx) {
-        if (!ctx.request.depositChange) {
-          throw new Error("Invalid step: depositChange is required with increaseDeposit");
-        }
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        // add ETH
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "addCollWithRawETH",
-            args: [BigInt(ctx.request.loan.troveId)],
-            value: ctx.request.depositChange[0],
-          });
-        }
-
-        // add LST
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "addColl",
-          args: [BigInt(ctx.request.loan.troveId), ctx.request.depositChange[0]],
-        });
+        return ctx.writeContract(await buildDepositCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -313,32 +279,7 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
       Status: TransactionStatus,
 
       async commit(ctx) {
-        if (!ctx.request.depositChange) {
-          throw new Error("Invalid step: depositChange is required with decreaseDeposit");
-        }
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        const args = [
-          BigInt(ctx.request.loan.troveId),
-          ctx.request.depositChange[0] * -1n,
-        ] as const;
-
-        // withdraw ETH
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "withdrawCollToRawETH",
-            args,
-          });
-        }
-
-        // withdraw LST
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "withdrawColl",
-          args,
-        });
+        return ctx.writeContract(await buildWithdrawCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -351,34 +292,7 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
       Status: TransactionStatus,
 
       async commit(ctx) {
-        if (ctx.request.leverage?.direction !== "up") {
-          throw new Error("Invalid step: leverUpTrove");
-        }
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        const args = [{
-          troveId: BigInt(ctx.request.loan.troveId),
-          flashLoanAmount: dn.from(ctx.request.leverage.flashloanAmount, 18)[0],
-          boldAmount: dn.from(ctx.request.leverage.boldAmount, 18)[0],
-          maxUpfrontFee: MAX_UPFRONT_FEE,
-        }] as const;
-
-        // leverage up ETH trove
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "leverUpTrove",
-            args,
-          });
-        }
-
-        // leverage up LST trove
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "leverUpTrove",
-          args,
-        });
+        return ctx.writeContract(await buildLeverUpCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -391,31 +305,7 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
       Status: TransactionStatus,
 
       async commit(ctx) {
-        if (ctx.request.leverage?.direction !== "down") {
-          throw new Error("Invalid step: leverDownTrove");
-        }
-
-        const branch = getBranch(ctx.request.loan.branchId);
-
-        const args = [{
-          troveId: BigInt(ctx.request.loan.troveId),
-          flashLoanAmount: dn.from(ctx.request.leverage.flashloanAmount, 18)[0],
-          minBoldAmount: dn.from(ctx.request.leverage.minBoldAmount)[0],
-        }] as const;
-
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            ...branch.contracts.LeverageWETHZapper,
-            functionName: "leverDownTrove",
-            args,
-          });
-        }
-
-        return ctx.writeContract({
-          ...branch.contracts.LeverageLSTZapper,
-          functionName: "leverDownTrove",
-          args,
-        });
+        return ctx.writeContract(await buildLeverDownCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -435,13 +325,14 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
       async commit({ request, preferredApproveMethod, account, wagmiConfig, readContract }) {
         const { depositChange, leverage, loan } = request;
         const branch = getBranch(loan.branchId);
-        const calls: {
-          to: `0x${string}`;
-          abi: readonly unknown[];
-          functionName: string;
-          args: unknown[];
-          value?: bigint;
-        }[] = [];
+
+        const calls: ReturnType<
+          | typeof buildApproveLstCall
+          | typeof buildDepositCall
+          | typeof buildWithdrawCall
+          | typeof buildLeverUpCall
+          | typeof buildLeverDownCall
+        >[] = [];
 
         // approval for non-ETH collateral deposits
         if (branch.symbol !== "ETH" && depositChange && dn.gt(depositChange, 0)) {
@@ -455,111 +346,29 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
           );
 
           if (dn.lt(allowance, depositChange)) {
-            calls.push({
-              to: CollToken.address,
-              abi: CollToken.abi,
-              functionName: "approve",
-              args: [
-                LeverageLSTZapper.address,
-                preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : depositChange[0],
-              ],
-            });
+            calls.push(buildApproveLstCall(request, preferredApproveMethod));
           }
         }
 
         if (leverage?.direction === "down") {
-          const args = [{
-            troveId: BigInt(loan.troveId),
-            flashLoanAmount: dn.from(leverage.flashloanAmount, 18)[0],
-            minBoldAmount: dn.from(leverage.minBoldAmount)[0],
-          }];
-
-          if (branch.symbol === "ETH") {
-            calls.push({
-              to: branch.contracts.LeverageWETHZapper.address,
-              abi: branch.contracts.LeverageWETHZapper.abi,
-              functionName: "leverDownTrove",
-              args,
-            });
-          } else {
-            calls.push({
-              to: branch.contracts.LeverageLSTZapper.address,
-              abi: branch.contracts.LeverageLSTZapper.abi,
-              functionName: "leverDownTrove",
-              args,
-            });
-          }
+          calls.push(buildLeverDownCall(request));
         }
 
         if (depositChange) {
           if (dn.gt(depositChange, 0)) {
-            if (branch.symbol === "ETH") {
-              calls.push({
-                to: branch.contracts.LeverageWETHZapper.address,
-                abi: branch.contracts.LeverageWETHZapper.abi,
-                functionName: "addCollWithRawETH",
-                args: [BigInt(loan.troveId)],
-                value: depositChange[0],
-              });
-            } else {
-              calls.push({
-                to: branch.contracts.LeverageLSTZapper.address,
-                abi: branch.contracts.LeverageLSTZapper.abi,
-                functionName: "addColl",
-                args: [BigInt(loan.troveId), depositChange[0]],
-              });
-            }
+            calls.push(buildDepositCall(request));
           } else {
-            const args = [BigInt(loan.troveId), depositChange[0] * -1n];
-
-            if (branch.symbol === "ETH") {
-              calls.push({
-                to: branch.contracts.LeverageWETHZapper.address,
-                abi: branch.contracts.LeverageWETHZapper.abi,
-                functionName: "withdrawCollToRawETH",
-                args,
-              });
-            } else {
-              calls.push({
-                to: branch.contracts.LeverageLSTZapper.address,
-                abi: branch.contracts.LeverageLSTZapper.abi,
-                functionName: "withdrawColl",
-                args,
-              });
-            }
+            calls.push(buildWithdrawCall(request));
           }
         }
 
         if (leverage?.direction === "up") {
-          const args = [{
-            troveId: BigInt(loan.troveId),
-            flashLoanAmount: dn.from(leverage.flashloanAmount, 18)[0],
-            boldAmount: dn.from(leverage.boldAmount, 18)[0],
-            maxUpfrontFee: MAX_UPFRONT_FEE,
-          }];
-
-          if (branch.symbol === "ETH") {
-            calls.push({
-              to: branch.contracts.LeverageWETHZapper.address,
-              abi: branch.contracts.LeverageWETHZapper.abi,
-              functionName: "leverUpTrove",
-              args,
-            });
-          } else {
-            calls.push({
-              to: branch.contracts.LeverageLSTZapper.address,
-              abi: branch.contracts.LeverageLSTZapper.abi,
-              functionName: "leverUpTrove",
-              args,
-            });
-          }
+          calls.push(buildLeverUpCall(request));
         }
 
         return (await sendCalls(wagmiConfig, {
           account,
-          calls,
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 
@@ -616,3 +425,127 @@ export const updateLeveragePosition: FlowDeclaration<UpdateLeveragePositionReque
     return v.parse(RequestSchema, request);
   },
 };
+
+function buildApproveLstCall(
+  request: UpdateLeveragePositionRequest,
+  preferredApproveMethod: "permit" | "approve-amount" | "approve-infinite",
+) {
+  const branch = getBranch(request.loan.branchId);
+  const Zapper = branch.contracts.LeverageLSTZapper;
+
+  if (!request.depositChange) {
+    throw new Error("buildApproveLstCall: depositChange is required");
+  }
+
+  return {
+    ...branch.contracts.CollToken,
+    functionName: "approve" as const,
+    args: [
+      Zapper.address,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256
+        : request.depositChange[0],
+    ] as const,
+  };
+}
+
+function buildDepositCall(request: UpdateLeveragePositionRequest) {
+  if (!request.depositChange) {
+    throw new Error("buildDepositCall: depositChange is required");
+  }
+
+  const branch = getBranch(request.loan.branchId);
+
+  if (branch.symbol === "ETH") {
+    return {
+      ...branch.contracts.LeverageWETHZapper,
+      functionName: "addCollWithRawETH" as const,
+      args: [BigInt(request.loan.troveId)] as const,
+      value: request.depositChange[0],
+    };
+  }
+
+  return {
+    ...branch.contracts.LeverageLSTZapper,
+    functionName: "addColl" as const,
+    args: [BigInt(request.loan.troveId), request.depositChange[0]] as const,
+  };
+}
+
+function buildWithdrawCall(request: UpdateLeveragePositionRequest) {
+  if (!request.depositChange) {
+    throw new Error("buildWithdrawCall: depositChange is required");
+  }
+
+  const branch = getBranch(request.loan.branchId);
+  const args = [BigInt(request.loan.troveId), request.depositChange[0] * -1n] as const;
+
+  if (branch.symbol === "ETH") {
+    return {
+      ...branch.contracts.LeverageWETHZapper,
+      functionName: "withdrawCollToRawETH" as const,
+      args,
+    };
+  }
+
+  return {
+    ...branch.contracts.LeverageLSTZapper,
+    functionName: "withdrawColl" as const,
+    args,
+  };
+}
+
+function buildLeverUpCall(request: UpdateLeveragePositionRequest) {
+  if (request.leverage?.direction !== "up") {
+    throw new Error("buildLeverUpCall: leverage direction must be up");
+  }
+
+  const branch = getBranch(request.loan.branchId);
+  const args = [{
+    troveId: BigInt(request.loan.troveId),
+    flashLoanAmount: dn.from(request.leverage.flashloanAmount, 18)[0],
+    boldAmount: dn.from(request.leverage.boldAmount, 18)[0],
+    maxUpfrontFee: MAX_UPFRONT_FEE,
+  }] as const;
+
+  if (branch.symbol === "ETH") {
+    return {
+      ...branch.contracts.LeverageWETHZapper,
+      functionName: "leverUpTrove" as const,
+      args,
+    };
+  }
+
+  return {
+    ...branch.contracts.LeverageLSTZapper,
+    functionName: "leverUpTrove" as const,
+    args,
+  };
+}
+
+function buildLeverDownCall(request: UpdateLeveragePositionRequest) {
+  if (request.leverage?.direction !== "down") {
+    throw new Error("buildLeverDownCall: leverage direction must be down");
+  }
+
+  const branch = getBranch(request.loan.branchId);
+  const args = [{
+    troveId: BigInt(request.loan.troveId),
+    flashLoanAmount: dn.from(request.leverage.flashloanAmount, 18)[0],
+    minBoldAmount: dn.from(request.leverage.minBoldAmount)[0],
+  }] as const;
+
+  if (branch.symbol === "ETH") {
+    return {
+      ...branch.contracts.LeverageWETHZapper,
+      functionName: "leverDownTrove" as const,
+      args,
+    };
+  }
+
+  return {
+    ...branch.contracts.LeverageLSTZapper,
+    functionName: "leverDownTrove" as const,
+    args,
+  };
+}

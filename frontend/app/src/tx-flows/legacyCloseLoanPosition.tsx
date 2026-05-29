@@ -101,22 +101,10 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
         />
       ),
       async commit(ctx) {
-        const { trove } = ctx.request;
-        const { LEVERAGE_ZAPPER } = getLegacyBranch(trove.branchId);
-        if (!LEGACY_CHECK?.BOLD_TOKEN) {
-          throw new Error("BOLD token address not available");
-        }
-        return ctx.writeContract({
-          abi: erc20Abi,
-          address: LEGACY_CHECK.BOLD_TOKEN,
-          functionName: "approve",
-          args: [
-            LEVERAGE_ZAPPER,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.mul(trove.borrowed, 1.1)[0], // exact amount (TODO: better estimate)
-          ],
-        });
+        return ctx.writeContract(buildApproveBoldCall(
+          ctx.request,
+          ctx.preferredApproveMethod,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -129,27 +117,7 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { trove } = ctx.request;
-        const branch = getLegacyBranch(trove.branchId);
-        const { LEVERAGE_ZAPPER } = branch;
-
-        // repay with BOLD => get ETH
-        if (branch.symbol === "ETH") {
-          return ctx.writeContract({
-            abi: LeverageWETHZapper,
-            address: LEVERAGE_ZAPPER,
-            functionName: "closeTroveToRawETH",
-            args: [BigInt(trove.troveId)],
-          });
-        }
-
-        // repay with BOLD => get LST
-        return ctx.writeContract({
-          abi: LeverageLSTZapper,
-          address: LEVERAGE_ZAPPER,
-          functionName: "closeTroveToRawETH",
-          args: [BigInt(trove.troveId)],
-        });
+        return ctx.writeContract(buildCloseTroveCall(ctx.request));
       },
 
       async verify(ctx, hash) {
@@ -162,35 +130,14 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { trove } = ctx.request;
-        const branch = getLegacyBranch(trove.branchId);
-        const { LEVERAGE_ZAPPER } = branch;
-
-        if (!LEGACY_CHECK?.BOLD_TOKEN) {
-          throw new Error("BOLD token address not available");
-        }
+        const calls = [
+          buildApproveBoldCall(ctx.request, ctx.preferredApproveMethod),
+          buildCloseTroveCall(ctx.request),
+        ];
 
         return (await sendCalls(ctx.wagmiConfig, {
           account: ctx.account,
-          calls: [
-            {
-              to: LEGACY_CHECK.BOLD_TOKEN,
-              abi: erc20Abi,
-              functionName: "approve",
-              args: [
-                LEVERAGE_ZAPPER,
-                ctx.preferredApproveMethod === "approve-infinite"
-                  ? maxUint256
-                  : dn.mul(trove.borrowed, 1.1)[0],
-              ],
-            },
-            {
-              to: LEVERAGE_ZAPPER,
-              abi: branch.symbol === "ETH" ? LeverageWETHZapper : LeverageLSTZapper,
-              functionName: "closeTroveToRawETH",
-              args: [BigInt(trove.troveId)],
-            },
-          ],
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
 
@@ -239,3 +186,40 @@ export const legacyCloseLoanPosition: FlowDeclaration<LegacyCloseLoanPositionReq
     return v.parse(RequestSchema, request);
   },
 };
+
+function buildApproveBoldCall(
+  request: LegacyCloseLoanPositionRequest,
+  preferredApproveMethod: "permit" | "approve-amount" | "approve-infinite",
+) {
+  const { trove } = request;
+  const { LEVERAGE_ZAPPER } = getLegacyBranch(trove.branchId);
+
+  if (!LEGACY_CHECK?.BOLD_TOKEN) {
+    throw new Error("BOLD token address not available");
+  }
+
+  return {
+    abi: erc20Abi,
+    address: LEGACY_CHECK.BOLD_TOKEN,
+    functionName: "approve" as const,
+    args: [
+      LEVERAGE_ZAPPER,
+      preferredApproveMethod === "approve-infinite"
+        ? maxUint256 // infinite approval
+        : dn.mul(trove.borrowed, 1.1)[0], // exact amount (TODO: better estimate)
+    ] as const,
+  };
+}
+
+function buildCloseTroveCall(request: LegacyCloseLoanPositionRequest) {
+  const { trove } = request;
+  const branch = getLegacyBranch(trove.branchId);
+  const { LEVERAGE_ZAPPER } = branch;
+
+  return {
+    abi: branch.symbol === "ETH" ? LeverageWETHZapper : LeverageLSTZapper,
+    address: LEVERAGE_ZAPPER,
+    functionName: "closeTroveToRawETH" as const,
+    args: [BigInt(trove.troveId)] as const,
+  };
+}

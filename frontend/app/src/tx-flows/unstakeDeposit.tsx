@@ -140,6 +140,58 @@ async function getUnstakeContext(ctx: FlowParams<UnstakeDepositRequest>) {
   };
 }
 
+function buildResetVotesCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+  allocatedInitiatives: Address[],
+) {
+  return {
+    ...Governance,
+    functionName: "resetAllocations" as const,
+    args: [allocatedInitiatives, true] as const,
+  };
+}
+
+function buildReallocateVotesCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+  allocatedInitiatives: Address[],
+  newAllocations: Record<Address, { amount: bigint; vote: "for" | "against" }>,
+) {
+  const initiativeAddresses = Object.keys(newAllocations) as Address[];
+  const [votes, vetos] = initiativeAddresses.reduce(
+    ([v, ve], address, index) => {
+      const allocation = newAllocations[address];
+      if (!allocation) return [v, ve];
+      if (allocation.vote === "for") {
+        v[index] = allocation.amount;
+      } else if (allocation.vote === "against") {
+        ve[index] = allocation.amount;
+      }
+      return [v, ve];
+    },
+    [
+      Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
+      Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
+    ],
+  );
+
+  return {
+    ...Governance,
+    functionName: "allocateLQTY" as const,
+    args: [allocatedInitiatives, initiativeAddresses, votes, vetos] as const,
+  };
+}
+
+function buildWithdrawCall(
+  Governance: { address: Address; abi: readonly unknown[] },
+  unstakeAmount: bigint,
+) {
+  return {
+    ...Governance,
+    functionName: "withdrawLQTY" as const,
+    args: [unstakeAmount] as const,
+  };
+}
+
 export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
   title: "Review & Send Transaction",
 
@@ -196,12 +248,7 @@ export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
           initiativesStates,
         } = await getUnstakeContext(ctx);
 
-        const calls: Array<{
-          to: typeof Governance.address;
-          abi: typeof Governance.abi;
-          functionName: string;
-          args: unknown[];
-        }> = [];
+        const calls: ReturnType<typeof buildResetVotesCall | typeof buildReallocateVotesCall | typeof buildWithdrawCall>[] = [];
 
         if (nonZeroAllocations.length > 0) {
           const strategy = isFullUnstake
@@ -214,50 +261,21 @@ export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
             );
 
           if (isFullUnstake || strategy?.needsResetOnly) {
-            calls.push({
-              to: Governance.address,
-              abi: Governance.abi,
-              functionName: "resetAllocations",
-              args: [allocatedInitiatives, true],
-            });
+            calls.push(buildResetVotesCall(Governance, allocatedInitiatives));
           } else if (strategy?.needsReallocation && strategy.newAllocations) {
-            const initiativeAddresses = Object.keys(strategy.newAllocations) as Address[];
-            const [votes, vetos] = initiativeAddresses.reduce(
-              ([v, ve], address, index) => {
-                const allocation = strategy.newAllocations![address];
-                if (!allocation) return [v, ve];
-                if (allocation.vote === "for") {
-                  v[index] = allocation.amount;
-                } else if (allocation.vote === "against") {
-                  ve[index] = allocation.amount;
-                }
-                return [v, ve];
-              },
-              [
-                Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
-                Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
-              ],
-            );
-
-            calls.push({
-              to: Governance.address,
-              abi: Governance.abi,
-              functionName: "allocateLQTY",
-              args: [allocatedInitiatives, initiativeAddresses, votes, vetos],
-            });
+            calls.push(buildReallocateVotesCall(
+              Governance,
+              allocatedInitiatives,
+              strategy.newAllocations,
+            ));
           }
         }
 
-        calls.push({
-          to: Governance.address,
-          abi: Governance.abi,
-          functionName: "withdrawLQTY",
-          args: [unstakeAmount],
-        });
+        calls.push(buildWithdrawCall(Governance, unstakeAmount));
 
         return (await sendCalls(ctx.wagmiConfig, {
           account: ctx.account,
-          calls,
+          calls: calls.map((call) => ({ ...call, to: call.address })),
         })).id;
       },
       async verify(ctx, hash) {
@@ -276,11 +294,7 @@ export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
           throw new Error("No voting allocations to reset.");
         }
 
-        return ctx.writeContract({
-          ...Governance,
-          functionName: "resetAllocations",
-          args: [allocatedInitiatives, true],
-        });
+        return ctx.writeContract(buildResetVotesCall(Governance, allocatedInitiatives));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -311,29 +325,11 @@ export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
           throw new Error("No reallocation needed. Please restart the flow.");
         }
 
-        const initiativeAddresses = Object.keys(strategy.newAllocations) as Address[];
-        const [votes, vetos] = initiativeAddresses.reduce(
-          ([v, ve], address, index) => {
-            const allocation = strategy.newAllocations![address];
-            if (!allocation) return [v, ve];
-            if (allocation.vote === "for") {
-              v[index] = allocation.amount;
-            } else if (allocation.vote === "against") {
-              ve[index] = allocation.amount;
-            }
-            return [v, ve];
-          },
-          [
-            Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
-            Array.from<bigint>({ length: initiativeAddresses.length }).fill(0n),
-          ],
-        );
-
-        return ctx.writeContract({
-          ...Governance,
-          functionName: "allocateLQTY",
-          args: [allocatedInitiatives, initiativeAddresses, votes, vetos],
-        });
+        return ctx.writeContract(buildReallocateVotesCall(
+          Governance,
+          allocatedInitiatives,
+          strategy.newAllocations,
+        ));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -347,11 +343,7 @@ export const unstakeDeposit: FlowDeclaration<UnstakeDepositRequest> = {
         const { Governance } = ctx.contracts;
         const { unstakeAmount } = await getUnstakeContext(ctx);
 
-        return ctx.writeContract({
-          ...Governance,
-          functionName: "withdrawLQTY",
-          args: [unstakeAmount],
-        });
+        return ctx.writeContract(buildWithdrawCall(Governance, unstakeAmount));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);

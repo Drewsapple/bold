@@ -1,4 +1,4 @@
-import type { FlowDeclaration } from "@/src/services/TransactionFlow";
+import type { FlowDeclaration, FlowStepDeclaration } from "@/src/services/TransactionFlow";
 import type { TroveId } from "@/src/types";
 
 import { Amount } from "@/src/comps/Amount/Amount";
@@ -45,6 +45,75 @@ const RequestSchema = createRequestSchema(
 );
 
 export type OpenLeveragePositionRequest = v.InferOutput<typeof RequestSchema>;
+
+const buildApproveLstCall = async (
+  ctx: Parameters<FlowStepDeclaration<OpenLeveragePositionRequest>["commit"]>[0],
+) => {
+  const { loan } = ctx.request;
+  const branch = getBranch(loan.branchId);
+  const { LeverageLSTZapper, CollToken } = branch.contracts;
+
+  return {
+    ...CollToken,
+    functionName: "approve" as const,
+    args: [
+      LeverageLSTZapper.address,
+      ctx.preferredApproveMethod === "approve-infinite"
+        ? maxUint256 // infinite approval
+        : dn.from(ctx.request.initialDeposit, 18)[0], // exact amount
+    ],
+  } as const;
+};
+
+const buildOpenLeveragedTroveCall = async (
+  ctx: Parameters<FlowStepDeclaration<OpenLeveragePositionRequest>["commit"]>[0],
+  ownerIndex: number,
+) => {
+  const { loan } = ctx.request;
+  const branch = getBranch(loan.branchId);
+  const { LeverageLSTZapper, LeverageWETHZapper } = branch.contracts;
+
+  const { upperHint, lowerHint } = await getTroveOperationHints({
+    wagmiConfig: ctx.wagmiConfig,
+    contracts: ctx.contracts,
+    branchId: loan.branchId,
+    interestRate: loan.interestRate[0],
+  });
+
+  const txParams = {
+    owner: loan.borrower,
+    ownerIndex: BigInt(ownerIndex),
+    collAmount: dn.from(ctx.request.initialDeposit, 18)[0],
+    flashLoanAmount: dn.from(ctx.request.flashloanAmount, 18)[0],
+    boldAmount: dn.from(ctx.request.boldAmount, 18)[0],
+    upperHint,
+    lowerHint,
+    annualInterestRate: loan.batchManager ? 0n : loan.interestRate[0],
+    batchManager: loan.batchManager ?? ADDRESS_ZERO,
+    maxUpfrontFee: MAX_UPFRONT_FEE,
+    addManager: ADDRESS_ZERO,
+    removeManager: ADDRESS_ZERO,
+    receiver: ADDRESS_ZERO,
+  };
+
+  // ETH collateral case
+  if (branch.symbol === "ETH") {
+    return {
+      ...LeverageWETHZapper,
+      functionName: "openLeveragedTroveWithRawETH" as const,
+      args: [txParams],
+      value: dn.from(ctx.request.initialDeposit, 18)[0] + ETH_GAS_COMPENSATION[0],
+    } as const;
+  }
+
+  // LST collateral case
+  return {
+    ...LeverageLSTZapper,
+    functionName: "openLeveragedTroveWithRawETH" as const,
+    args: [txParams],
+    value: ETH_GAS_COMPENSATION[0],
+  } as const;
+};
 
 export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> = {
   title: "Review & Send Transaction",
@@ -207,19 +276,7 @@ export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> 
         />
       ),
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const branch = getBranch(loan.branchId);
-        const { LeverageLSTZapper, CollToken } = branch.contracts;
-        return ctx.writeContract({
-          ...CollToken,
-          functionName: "approve",
-          args: [
-            LeverageLSTZapper.address,
-            ctx.preferredApproveMethod === "approve-infinite"
-              ? maxUint256 // infinite approval
-              : dn.from(ctx.request.initialDeposit, 18)[0], // exact amount
-          ],
-        });
+        return ctx.writeContract(await buildApproveLstCall(ctx));
       },
       async verify(ctx, hash) {
         await verifyTransaction(ctx.wagmiConfig, hash, ctx.isSafe);
@@ -231,52 +288,10 @@ export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const branch = getBranch(loan.branchId);
-        const { LeverageLSTZapper, LeverageWETHZapper } = branch.contracts;
-
-        const { upperHint, lowerHint } = await getTroveOperationHints({
-          wagmiConfig: ctx.wagmiConfig,
-          contracts: ctx.contracts,
-          branchId: loan.branchId,
-          interestRate: loan.interestRate[0],
-        });
-
-        return withOwnerIndexRetry(ctx.request.ownerIndex, (ownerIndex) => {
-          const txParams = {
-            owner: loan.borrower,
-            ownerIndex: BigInt(ownerIndex),
-            collAmount: dn.from(ctx.request.initialDeposit, 18)[0],
-            flashLoanAmount: dn.from(ctx.request.flashloanAmount, 18)[0],
-            boldAmount: dn.from(ctx.request.boldAmount, 18)[0],
-            upperHint,
-            lowerHint,
-            annualInterestRate: loan.batchManager ? 0n : loan.interestRate[0],
-            batchManager: loan.batchManager ?? ADDRESS_ZERO,
-            maxUpfrontFee: MAX_UPFRONT_FEE,
-            addManager: ADDRESS_ZERO,
-            removeManager: ADDRESS_ZERO,
-            receiver: ADDRESS_ZERO,
-          };
-
-          // ETH collateral case
-          if (branch.symbol === "ETH") {
-            return ctx.writeContract({
-              ...LeverageWETHZapper,
-              functionName: "openLeveragedTroveWithRawETH",
-              args: [txParams],
-              value: dn.from(ctx.request.initialDeposit, 18)[0] + ETH_GAS_COMPENSATION[0],
-            });
-          }
-
-          // LST collateral case
-          return ctx.writeContract({
-            ...LeverageLSTZapper,
-            functionName: "openLeveragedTroveWithRawETH",
-            args: [txParams],
-            value: ETH_GAS_COMPENSATION[0],
-          });
-        });
+        return withOwnerIndexRetry(
+          ctx.request.ownerIndex,
+          async (ownerIndex) => ctx.writeContract(await buildOpenLeveragedTroveCall(ctx, ownerIndex)),
+        );
       },
 
       async verify(ctx, hash) {
@@ -333,56 +348,17 @@ export const openLeveragePosition: FlowDeclaration<OpenLeveragePositionRequest> 
       Status: TransactionStatus,
 
       async commit(ctx) {
-        const { loan } = ctx.request;
-        const branch = getBranch(loan.branchId);
-        const { LeverageLSTZapper, CollToken } = branch.contracts;
-
-        const { upperHint, lowerHint } = await getTroveOperationHints({
-          wagmiConfig: ctx.wagmiConfig,
-          contracts: ctx.contracts,
-          branchId: loan.branchId,
-          interestRate: loan.interestRate[0],
-        });
+        const approveCallPromise = buildApproveLstCall(ctx);
 
         return withOwnerIndexRetry(ctx.request.ownerIndex, async (ownerIndex) => {
-          const txParams = {
-            owner: loan.borrower,
-            ownerIndex: BigInt(ownerIndex),
-            collAmount: dn.from(ctx.request.initialDeposit, 18)[0],
-            flashLoanAmount: dn.from(ctx.request.flashloanAmount, 18)[0],
-            boldAmount: dn.from(ctx.request.boldAmount, 18)[0],
-            upperHint,
-            lowerHint,
-            annualInterestRate: loan.batchManager ? 0n : loan.interestRate[0],
-            batchManager: loan.batchManager ?? ADDRESS_ZERO,
-            maxUpfrontFee: MAX_UPFRONT_FEE,
-            addManager: ADDRESS_ZERO,
-            removeManager: ADDRESS_ZERO,
-            receiver: ADDRESS_ZERO,
-          };
+          const [approveCall, openCall] = await Promise.all([
+            approveCallPromise,
+            buildOpenLeveragedTroveCall(ctx, ownerIndex),
+          ]);
 
           return (await sendCalls(ctx.wagmiConfig, {
             account: ctx.account,
-            calls: [
-              {
-                to: CollToken.address,
-                abi: CollToken.abi,
-                functionName: "approve",
-                args: [
-                  LeverageLSTZapper.address,
-                  ctx.preferredApproveMethod === "approve-infinite"
-                    ? maxUint256
-                    : dn.from(ctx.request.initialDeposit, 18)[0],
-                ],
-              },
-              {
-                to: LeverageLSTZapper.address,
-                abi: LeverageLSTZapper.abi,
-                functionName: "openLeveragedTroveWithRawETH",
-                args: [txParams],
-                value: ETH_GAS_COMPENSATION[0],
-              },
-            ],
+            calls: [approveCall, openCall].map((call) => ({ ...call, to: call.address })),
           })).id;
         });
       },
