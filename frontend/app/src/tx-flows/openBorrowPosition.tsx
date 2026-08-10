@@ -29,13 +29,8 @@ import { css } from "@/styled-system/css";
 import { ADDRESS_ZERO, InfoTooltip } from "@liquity2/uikit";
 import * as dn from "dnum";
 import * as v from "valibot";
-import { erc20Abi, maxUint256, parseEventLogs } from "viem";
-import {
-  getBalance,
-  readContract,
-  sendCalls,
-} from "wagmi/actions";
-import { CONTRACT_WETH } from "../env";
+import { maxUint256, parseEventLogs } from "viem";
+import { readContract, sendCalls } from "wagmi/actions";
 import { createRequestSchema, getCallBatchLogs, verifyCallsBatch, verifyTransaction, withOwnerIndexRetry } from "./shared";
 
 const RequestSchema = createRequestSchema(
@@ -414,53 +409,13 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
 
       async commit(ctx) {
         const approveCallPromise = approveLstCall(ctx);
-        const ethBalancePromise = getBalance(ctx.wagmiConfig, { address: ctx.account });
-        const wethBalancePromise = readContract(ctx.wagmiConfig, {
-          address: CONTRACT_WETH,
-          abi: erc20Abi,
-          functionName: "balanceOf",
-          args: [ctx.account],
-        });
         return withOwnerIndexRetry(ctx.request.ownerIndex, async (ownerIndex) => {
           const openTroveCallPromise = openTroveLstCall(ctx, ownerIndex);
 
-          const [approveCall, openTroveCall, ethBalance, wethBalance] = await Promise.all([
+          const [approveCall, openTroveCall] = await Promise.all([
             approveCallPromise,
             openTroveCallPromise,
-            ethBalancePromise,
-            wethBalancePromise,
           ]);
-
-          if (ethBalance.value < openTroveCall.value) {
-            if (wethBalance + ethBalance.value < openTroveCall.value) {
-              throw new Error("Insufficient balance to cover collateral and gas compensation");
-            } else {
-              // if user has enough balance in WETH, but not in ETH, we can unwrap WETH to ETH before opening the trove
-              return (await sendCalls(ctx.wagmiConfig, {
-                account: ctx.account,
-                calls: [
-                  { ...approveCall, to: approveCall.address },
-                  {
-                    to: CONTRACT_WETH,
-                    abi: [
-                      {
-                        "constant": false,
-                        "inputs": [{ "name": "wad", "type": "uint256" }],
-                        "name": "withdraw",
-                        "outputs": [],
-                        "payable": false,
-                        "stateMutability": "nonpayable",
-                        "type": "function",
-                      } as const,
-                    ] as const,
-                    functionName: "withdraw",
-                    args: [openTroveCall.value - ethBalance.value],
-                  },
-                  { ...openTroveCall, to: openTroveCall.address },
-                ],
-              })).id;
-            }
-          }
 
           return (await sendCalls(ctx.wagmiConfig, {
             account: ctx.account,
@@ -501,96 +456,6 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
       },
     },
 
-    // batchOpenTroveEth mode - includes WETH->ETH swap if needed
-    batchOpenTroveEth: {
-      name: () => "Open Position",
-      Status: TransactionStatus,
-
-      async commit(ctx) {
-        const ethBalancePromise = getBalance(ctx.wagmiConfig, { address: ctx.account });
-        const wethBalancePromise = readContract(ctx.wagmiConfig, {
-          address: CONTRACT_WETH,
-          abi: erc20Abi,
-          functionName: "balanceOf",
-          args: [ctx.account],
-        });
-        return withOwnerIndexRetry(ctx.request.ownerIndex, async (ownerIndex) => {
-          const openTroveCallPromise = openTroveEthCall(ctx, ownerIndex);
-
-          const [openTroveCall, ethBalance, wethBalance] = await Promise.all([
-            openTroveCallPromise,
-            ethBalancePromise,
-            wethBalancePromise,
-          ]);
-
-          if (ethBalance.value < openTroveCall.value) {
-            if (wethBalance + ethBalance.value < openTroveCall.value) {
-              throw new Error("Insufficient balance to cover collateral and gas compensation");
-            } else {
-              // If user has enough balance in WETH, but not in ETH, unwrap WETH to ETH before opening the trove
-              return (await sendCalls(ctx.wagmiConfig, {
-                account: ctx.account,
-                calls: [
-                  {
-                    to: CONTRACT_WETH,
-                    abi: [
-                      {
-                        "constant": false,
-                        "inputs": [{ "name": "wad", "type": "uint256" }],
-                        "name": "withdraw",
-                        "outputs": [],
-                        "payable": false,
-                        "stateMutability": "nonpayable",
-                        "type": "function",
-                      } as const,
-                    ] as const,
-                    functionName: "withdraw",
-                    args: [openTroveCall.value - ethBalance.value],
-                  },
-                  { ...openTroveCall, to: openTroveCall.address, value: openTroveCall.value },
-                ],
-              })).id;
-            }
-          }
-
-          // User has enough ETH, but still submit via sendCalls so verify always gets a calls ID
-          return (await sendCalls(ctx.wagmiConfig, {
-            account: ctx.account,
-            calls: [{ ...openTroveCall, to: openTroveCall.address, value: openTroveCall.value }],
-          })).id;
-        });
-      },
-
-      async verify(ctx, hash) {
-        const receipts = await verifyCallsBatch(ctx.wagmiConfig, hash);
-
-        // extract trove ID from logs
-        const branch = getBranch(ctx.request.branchId);
-
-        const [troveOperation] = parseEventLogs({
-          abi: branch.contracts.TroveManager.abi,
-          logs: getCallBatchLogs(receipts),
-          eventName: "TroveOperation",
-        });
-
-        if (!troveOperation?.args?._troveId) {
-          throw new Error("Failed to extract trove ID from transaction");
-        }
-        const troveId: TroveId = `0x${troveOperation.args._troveId.toString(16)}`;
-        const prefixedTroveId = getPrefixedTroveId(branch.branchId, troveId);
-
-        addPrefixedTroveIdsToStoredState(ctx.storedState, [prefixedTroveId]);
-
-        const subgraphIsDown = subgraphIndicator.hasError();
-        if (!subgraphIsDown) {
-          while (true) {
-            const trove = await getIndexedTroveById(branch.branchId, troveId);
-            if (trove !== null) break;
-            await sleep(1000);
-          }
-        }
-      },
-    },
   },
 
   async getSteps(ctx) {
@@ -599,19 +464,6 @@ export const openBorrowPosition: FlowDeclaration<OpenBorrowPositionRequest> = {
 
     // ETH doesn't need approval
     if (branch.symbol === "ETH") {
-      const totalEthNeeded = ctx.request.collAmount[0] + ETH_GAS_COMPENSATION[0];
-      const caps = await capsPromise;
-      // Check if we need to batch a WETH->ETH conversion before opening trove.
-      // Non-atomic batching is safe here because WETH->ETH is just converting
-      // the user's own collateral; there is no front-run risk.
-      // Note: In the future, we should also check for auxiliaryFunds capability to allow
-      // users to JIT add ETH inside their wallet when needed
-      if (caps.supportsBatch) {
-        const ethBalance = await getBalance(ctx.wagmiConfig, { address: ctx.account });
-        if (ethBalance.value < totalEthNeeded) {
-          return ["batchOpenTroveEth"];
-        }
-      }
       return ["openTroveEth"];
     }
 
